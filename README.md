@@ -44,6 +44,10 @@ pip install ./build/python_module/lib
 When `havokpy` is present, the importer will automatically convert binary
 packfiles to XML before creating Blender armatures and actions.
 
+The add-on will also search for a bundled `havokpy` next to
+`3rd_party/HavokLib` inside the add-on folder, so you can copy the compiled
+module there if you prefer not to install it globally.
+
 ## Development
 
 The add-on uses Blender's new `manifest.toml` packaging format (introduced for

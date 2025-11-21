@@ -10,16 +10,43 @@ importer can parse skeletons and animations without placeholders.
 from __future__ import annotations
 
 import importlib
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 
 def _load_havokpy():
+    module = sys.modules.get("havokpy")
+    if module is not None:
+        return module
+
     try:
         return importlib.import_module("havokpy")
     except ModuleNotFoundError:
-        return None
+        pass
+
+    addon_root = Path(__file__).resolve().parent.parent
+    search_roots = [addon_root / "3rd_party" / "HavokLib", addon_root / "3rd_party"]
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+
+        for candidate in root.rglob("havokpy.*"):
+            if not candidate.is_file():
+                continue
+
+            parent_str = str(candidate.parent)
+            if parent_str not in sys.path:
+                sys.path.insert(0, parent_str)
+
+            try:
+                return importlib.import_module("havokpy")
+            except Exception:
+                continue
+
+    return None
 
 
 def convert_packfile_to_xml(path: Path) -> Optional[bytes]:
