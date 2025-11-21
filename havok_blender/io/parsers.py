@@ -346,11 +346,20 @@ def parse_bytes(data: bytes, override_name: Optional[str] = None) -> HavokPack:
     """Parse Havok XML/IGZ data into skeleton and animation structures."""
 
     xml_bytes = _unwrap_bytes(data)
-    if b"<hkpackfile" not in xml_bytes:
-        # Sometimes IGZ payloads contain a full XML blob preceded by metadata.
-        marker = xml_bytes.find(b"<hkobject")
-        if marker > -1:
-            xml_bytes = xml_bytes[marker:]
+    # Trim leading container metadata by slicing from the first XML tag we
+    # recognize. This mirrors the io_scene_igz approach of aligning to the
+    # hkpackfile or hkobject root before parsing.
+    pack_marker = xml_bytes.find(b"<hkpackfile")
+    if pack_marker > -1:
+        xml_bytes = xml_bytes[pack_marker:]
+    else:
+        object_marker = xml_bytes.find(b"<hkobject")
+        if object_marker > -1:
+            xml_bytes = xml_bytes[object_marker:]
+        else:
+            generic_marker = xml_bytes.find(b"<")
+            if generic_marker > 0:
+                xml_bytes = xml_bytes[generic_marker:]
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:  # pragma: no cover - defensive guard
