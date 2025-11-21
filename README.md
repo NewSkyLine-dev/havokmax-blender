@@ -20,8 +20,10 @@ tool's presets.
 
 - **Import:** `File → Import → Havok (.hkx/.hkt/.hka/.igz/.pak)` will unpack
   compressed IGZ payloads, scan PAK containers (zip, tar, or raw blobs) for
-  Havok XML, and build an armature plus animation actions. PAK files optionally
-  accept an entry path via the importer UI.
+  Havok XML, and build an armature plus animation actions. Selecting a `.pak`
+  shows a tree of contained entries (parsed with the igArchiveExtractor
+  layouts); pick an entry to import or type a path manually in **Archive
+  entry**.
 - **Presets:** Configure scale and up/forward axes in **Preferences → Add-ons →
   Havok IO** or in the 3D View **Havok** side panel.
 

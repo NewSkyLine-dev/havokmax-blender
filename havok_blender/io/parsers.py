@@ -8,6 +8,7 @@ tracks for Blender armatures when data is present.
 from __future__ import annotations
 
 import gzip
+import lzma
 import tarfile
 import zipfile
 import zlib
@@ -21,6 +22,97 @@ import mathutils
 from .havoklib_bridge import convert_bytes_to_xml, convert_packfile_to_xml
 
 SUPPORTED_EXTENSIONS = {".hkx", ".hka", ".hkt", ".igz", ".pak"}
+
+_PAK_LAYOUTS: Dict[str, Dict[str, int]] = {
+    "SSA_WII": {
+        "num_files": 0x0C,
+        "name_loc": 0x18,
+        "name_len": 0x1C,
+        "local_header_len": 0x0C,
+        "checksum_loc": 0x30,
+        "checksum_len": 0x04,
+        "file_start_in_local": 0x00,
+        "file_size_in_local": 0x04,
+        "mode_in_local": 0x08,
+    },
+    "SSA_WIIU": {
+        "num_files": 0x0C,
+        "name_loc": 0x1C,
+        "name_len": 0x20,
+        "local_header_len": 0x0C,
+        "checksum_loc": 0x34,
+        "checksum_len": 0x04,
+        "file_start_in_local": 0x00,
+        "file_size_in_local": 0x04,
+        "mode_in_local": 0x08,
+    },
+    "SWAP_FORCE": {
+        "num_files": 0x0C,
+        "name_loc": 0x2C,
+        "name_len": 0x30,
+        "local_header_len": 0x10,
+        "checksum_loc": 0x38,
+        "checksum_len": 0x04,
+        "file_start_in_local": 0x04,
+        "file_size_in_local": 0x08,
+        "mode_in_local": 0x0C,
+    },
+    "LOST_ISLANDS": {
+        "num_files": 0x0C,
+        "name_loc": 0x28,
+        "name_len": 0x30,
+        "local_header_len": 0x10,
+        "checksum_loc": 0x38,
+        "checksum_len": 0x04,
+        "file_start_in_local": 0x00,
+        "file_size_in_local": 0x08,
+        "mode_in_local": 0x0C,
+    },
+    "TRAP_TEAM": {
+        "num_files": 0x0C,
+        "name_loc": 0x28,
+        "name_len": 0x30,
+        "local_header_len": 0x10,
+        "checksum_loc": 0x38,
+        "checksum_len": 0x04,
+        "file_start_in_local": 0x00,
+        "file_size_in_local": 0x08,
+        "mode_in_local": 0x0C,
+    },
+    "SUPER_CHARGERS": {
+        "num_files": 0x0C,
+        "name_loc": 0x2C,
+        "name_len": 0x30,
+        "local_header_len": 0x10,
+        "checksum_loc": 0x38,
+        "checksum_len": 0x04,
+        "file_start_in_local": 0x04,
+        "file_size_in_local": 0x08,
+        "mode_in_local": 0x0C,
+    },
+    "IMAGINATORS": {
+        "num_files": 0x0C,
+        "name_loc": 0x28,
+        "name_len": 0x30,
+        "local_header_len": 0x10,
+        "checksum_loc": 0x38,
+        "checksum_len": 0x04,
+        "file_start_in_local": 0x00,
+        "file_size_in_local": 0x08,
+        "mode_in_local": 0x0C,
+    },
+    "CRASH_NST": {
+        "num_files": 0x0C,
+        "name_loc": 0x24,
+        "name_len": 0x2C,
+        "local_header_len": 0x10,
+        "checksum_loc": 0x38,
+        "checksum_len": 0x04,
+        "file_start_in_local": 0x00,
+        "file_size_in_local": 0x08,
+        "mode_in_local": 0x0C,
+    },
+}
 
 
 @dataclass
@@ -49,6 +141,15 @@ class HavokAnimation:
 class HavokPack:
     skeleton: Optional[HavokSkeleton]
     animations: List[HavokAnimation]
+
+
+@dataclass
+class PakEntry:
+    name: str
+    offset: int
+    size: int
+    mode: int
+    endianness: str
 
 
 def load_from_path(path: Path, entry: Optional[str] = None) -> HavokPack:
@@ -132,6 +233,16 @@ def _extract_from_archive(path: Path, entry: Optional[str]) -> bytes:
     except tarfile.TarError:
         pass
 
+    pak_entries = _read_pak_entries(path)
+    if pak_entries:
+        entry_map = {p.name: p for p in pak_entries}
+        target_name = entry or (next((name for name in entry_map if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS), None))
+        if target_name is None:
+            target_name = pak_entries[0].name
+        if target_name not in entry_map:
+            raise ValueError(f"Entry '{target_name}' not found in PAK; options: {sorted(entry_map.keys())}")
+        return _decode_pak_entry(path.read_bytes(), entry_map[target_name], entry_map, pak_entries)
+
     # As a fallback, treat the PAK as a raw blob and attempt to pull embedded
     # Havok XML from it. This mirrors the lightweight extraction implemented in
     # the io_scene_igz and pak-importer community tools.
@@ -206,6 +317,131 @@ def _resolve_entry(choices: List[str], requested: Optional[str]) -> str:
             raise ValueError(f"Entry '{requested}' not found in archive; options: {choices}")
         return requested
     return choices[0]
+
+
+def _read_uint(data: bytes, offset: int, endianness: str) -> int:
+    order = "little" if endianness == "little" else "big"
+    return int.from_bytes(data[offset : offset + 4], order)
+
+
+def _try_layout(data: bytes, layout: Dict[str, int], endianness: str) -> Optional[List[PakEntry]]:
+    num_files = _read_uint(data, layout["num_files"], endianness)
+    if num_files <= 0 or num_files > 10_000:
+        return None
+
+    name_loc = layout["name_loc"]
+    name_len = layout["name_len"]
+    name_table_end = name_loc + _read_uint(data, name_len, endianness)
+    if name_table_end > len(data):
+        return None
+
+    names: List[str] = []
+    for idx in range(num_files):
+        offset_ptr = name_loc + 4 * idx
+        if offset_ptr + 4 > len(data):
+            return None
+        name_offset = _read_uint(data, offset_ptr, endianness)
+        start = name_loc + name_offset
+        if start >= len(data):
+            return None
+        end = data.find(b"\x00", start, len(data))
+        if end == -1:
+            return None
+        try:
+            names.append(data[start:end].decode("utf-8", errors="ignore"))
+        except UnicodeDecodeError:
+            return None
+
+    checksum_loc = layout["checksum_loc"]
+    checksum_len = layout["checksum_len"]
+    local_header_len = layout["local_header_len"]
+    file_start_in_local = layout["file_start_in_local"]
+    file_size_in_local = layout["file_size_in_local"]
+    mode_in_local = layout["mode_in_local"]
+
+    entries: List[PakEntry] = []
+    base_header = checksum_loc + checksum_len * num_files
+    for idx in range(num_files):
+        header_base = base_header + local_header_len * idx
+        if header_base + max(file_start_in_local, file_size_in_local, mode_in_local) + 4 > len(data):
+            return None
+        start = _read_uint(data, header_base + file_start_in_local, endianness)
+        size = _read_uint(data, header_base + file_size_in_local, endianness)
+        mode = _read_uint(data, header_base + mode_in_local, endianness)
+        if start >= len(data) or size <= 0:
+            return None
+        entries.append(PakEntry(name=names[idx], offset=start, size=size, mode=mode, endianness=endianness))
+
+    return entries
+
+
+def _read_pak_entries(path: Path) -> List[PakEntry]:
+    data = path.read_bytes()
+    if len(data) < 0x40:
+        return []
+
+    magic = data[:4]
+    if magic not in (b"\x1AAGI", b"IGA\x1A"):
+        return []
+    endianness = "little" if magic == b"\x1AAGI" else "big"
+
+    for layout in _PAK_LAYOUTS.values():
+        entries = _try_layout(data, layout, endianness)
+        if entries:
+            return entries
+    return []
+
+
+def enumerate_pak_entries(path: Path) -> List[PakEntry]:
+    """Return parsed PAK entries for UI listing."""
+
+    return _read_pak_entries(path)
+
+
+def _decode_pak_entry(data: bytes, entry: PakEntry, entry_map: Dict[str, PakEntry], ordered: List[PakEntry]) -> bytes:
+    # Heuristic: the compressed blob spans until the next entry or EOF.
+    ordered_sorted = sorted(ordered, key=lambda e: e.offset)
+    next_offsets = [e.offset for e in ordered_sorted if e.offset > entry.offset]
+    end = min(next_offsets) if next_offsets else len(data)
+    blob = data[entry.offset:end]
+
+    mode_prefix = (entry.mode >> 24) & 0xFF
+    if entry.mode == 0xFFFFFFFF or mode_prefix == 0xFF:
+        return blob[: entry.size]
+
+    # Try straightforward zlib first; many variants use deflate-chunked blocks.
+    if mode_prefix in (0x00, 0x10):
+        try:
+            return zlib.decompress(blob, bufsize=entry.size)
+        except Exception:
+            pass
+        # Fallback: treat the stream as a sequence of length-prefixed chunks.
+        out = bytearray()
+        idx = 0
+        while idx + 2 <= len(blob) and len(out) < entry.size:
+            comp_len = int.from_bytes(blob[idx : idx + 2], entry.endianness)
+            idx += 2
+            if comp_len <= 0 or idx + comp_len > len(blob):
+                break
+            chunk = blob[idx : idx + comp_len]
+            idx += comp_len
+            try:
+                out.extend(zlib.decompress(chunk))
+            except Exception:
+                out.extend(chunk)
+        if out:
+            return bytes(out[: entry.size])
+
+    if mode_prefix == 0x20:
+        # LZMA blocks: assume 5-byte properties followed by compressed size.
+        try:
+            props = blob[:5]
+            lzma_blob = blob[5:]
+            return lzma.LZMADecompressor().decompress(props + lzma_blob)[: entry.size]
+        except Exception:
+            pass
+
+    return blob[: entry.size]
 
 
 def _parse_skeleton(root: ET.Element, override_name: Optional[str]) -> Optional[HavokSkeleton]:

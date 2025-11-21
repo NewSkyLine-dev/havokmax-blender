@@ -3,6 +3,8 @@ from . import import_havok, preferences
 
 classes = (
     preferences.HAVOK_AddonPreferences,
+    import_havok.HavokPakEntry,
+    import_havok.HAVOK_UL_pak_entries,
     import_havok.HAVOK_OT_import,
 )
 

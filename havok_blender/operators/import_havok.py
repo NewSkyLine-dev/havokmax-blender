@@ -8,7 +8,27 @@ import bpy
 from bpy_extras.io_utils import ImportHelper, axis_conversion
 from mathutils import Vector
 
+from ..io import parsers
 from ..io.parsers import HavokPack, load_from_path, SUPPORTED_EXTENSIONS
+
+
+class HavokPakEntry(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty()
+    size: bpy.props.IntProperty()
+    mode: bpy.props.StringProperty()
+
+
+class HAVOK_UL_pak_entries(bpy.types.UIList):
+    bl_idname = "HAVOK_UL_pak_entries"
+
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname):  # pragma: no cover - UI
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            layout.label(text=item.name, icon="FILE_ARCHIVE")
+            layout.label(text=f"{item.size} bytes")
+            layout.label(text=item.mode)
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=item.name)
 
 
 class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
@@ -23,6 +43,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         default="*.hkx;*.hkt;*.hka;*.igz;*.pak",
         options={"HIDDEN"},
     )
+
+    pak_entries: bpy.props.CollectionProperty(type=HavokPakEntry)
+    pak_active_index: bpy.props.IntProperty()
+    last_pak_path: bpy.props.StringProperty(options={"HIDDEN"})
 
     archive_entry: bpy.props.StringProperty(
         name="Archive entry",
@@ -45,11 +69,22 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         description="Create an armature from the Havok skeleton definition",
     )
 
+    def check(self, _context):  # pragma: no cover - UI callback
+        if self.filepath.lower().endswith(".pak") and self.filepath != self.last_pak_path:
+            self._load_pak_entries()
+            self.last_pak_path = self.filepath
+            return True
+        return False
+
     def execute(self, context: bpy.types.Context):
         filepath = Path(self.filepath)
         if filepath.suffix.lower() not in SUPPORTED_EXTENSIONS:
             self.report({"ERROR"}, f"Unsupported extension: {filepath.suffix}")
             return {"CANCELLED"}
+
+        if filepath.suffix.lower() == ".pak" and self.pak_entries:
+            if 0 <= self.pak_active_index < len(self.pak_entries):
+                self.archive_entry = self.pak_entries[self.pak_active_index].name
 
         try:
             pack = load_from_path(filepath, entry=self.archive_entry or None)
@@ -76,6 +111,17 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         layout.prop(self, "import_skeleton")
         layout.prop(self, "import_animation")
         layout.prop(self, "archive_entry")
+        if self.filepath.lower().endswith(".pak"):
+            row = layout.row()
+            row.template_list(
+                "HAVOK_UL_pak_entries",
+                "pak_entries",
+                self,
+                "pak_entries",
+                self,
+                "pak_active_index",
+                rows=5,
+            )
 
     def _build_armature(
         self,
@@ -113,6 +159,24 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             pose_bone.rotation_quaternion = bone.rotation
 
         return armature_obj
+
+    def _load_pak_entries(self) -> None:
+        self.pak_entries.clear()
+        if not self.filepath:
+            return
+        try:
+            entries = parsers.enumerate_pak_entries(Path(self.filepath))
+        except Exception:
+            return
+
+        for entry in entries:
+            item = self.pak_entries.add()
+            item.name = entry.name
+            item.size = entry.size
+            item.mode = hex(entry.mode)
+        if entries:
+            self.archive_entry = entries[0].name
+            self.pak_active_index = 0
 
     def _build_animations(
         self,
