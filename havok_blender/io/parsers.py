@@ -368,7 +368,10 @@ def _try_layout(data: bytes, layout: Dict[str, int], endianness: str) -> Optiona
         start = _read_uint(data, header_base + file_start_in_local, endianness)
         size = _read_uint(data, header_base + file_size_in_local, endianness)
         mode = _read_uint(data, header_base + mode_in_local, endianness)
-        if start >= len(data) or size <= 0 or start + size > len(data):
+        # Guard against bogus offsets or overflowed spans. Using a difference
+        # check avoids the possibility of start + size wrapping past len(data)
+        # on unusually large inputs.
+        if start < 0 or size <= 0 or start > len(data) or size > len(data) - start:
             return None
         entries.append(PakEntry(name=names[idx], offset=start, size=size, mode=mode, endianness=endianness))
 
