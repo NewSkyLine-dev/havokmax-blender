@@ -24,22 +24,155 @@ class HavokPakEntry(bpy.types.PropertyGroup):
     mode: bpy.props.StringProperty()
 
 
+class HavokPakTreeNode(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty()
+    path: bpy.props.StringProperty()
+    size: bpy.props.IntProperty()
+    mode: bpy.props.StringProperty()
+    level: bpy.props.IntProperty()
+    is_directory: bpy.props.BoolProperty()
+    expanded: bpy.props.BoolProperty(default=True)
+    parent_index: bpy.props.IntProperty(default=-1)
+    entry_index: bpy.props.IntProperty(default=-1)
+
+
+def _load_pak_entries(operator) -> None:
+    operator.pak_entries.clear()
+    operator.pak_tree_nodes.clear()
+    if not operator.filepath:
+        return
+    try:
+        entries = parsers.enumerate_pak_entries(
+            Path(operator.filepath), operator.pak_profile, operator.pak_platform
+        )
+    except Exception:
+        return
+
+    for entry in entries:
+        item = operator.pak_entries.add()
+        item.name = entry.name
+        item.size = entry.size
+        item.mode = hex(entry.mode)
+
+    _rebuild_pak_tree(operator)
+
+    if entries:
+        _set_active_entry(operator, 0)
+    else:
+        operator.archive_entry = ""
+        operator.pak_active_index = 0
+        operator.pak_tree_active_index = -1
+
+
+def _rebuild_pak_tree(operator) -> None:
+    operator.pak_tree_nodes.clear()
+    tree = {}
+
+    for idx, entry in enumerate(operator.pak_entries):
+        parts = [part for part in entry.name.split("/") if part] or [entry.name]
+        cursor = tree
+        for part in parts[:-1]:
+            cursor = cursor.setdefault(part, {"children": {}, "entry_index": -1})["children"]
+        leaf = parts[-1]
+        leaf_node = cursor.setdefault(leaf, {"children": {}, "entry_index": -1})
+        leaf_node["entry_index"] = idx
+
+    def _flatten(branch, parent_idx, level, prefix):
+        for name in sorted(branch.keys()):
+            data = branch[name]
+            node = operator.pak_tree_nodes.add()
+            node.name = name
+            node.path = f"{prefix}{name}" if prefix else name
+            node.level = level
+            node.parent_index = parent_idx
+            has_children = bool(data["children"])
+            node.is_directory = has_children
+            node.entry_index = data["entry_index"] if not has_children else -1
+            node.expanded = True
+            if not has_children and data["entry_index"] >= 0:
+                entry_data = operator.pak_entries[data["entry_index"]]
+                node.size = entry_data.size
+                node.mode = entry_data.mode
+            else:
+                node.size = 0
+                node.mode = ""
+            current_idx = len(operator.pak_tree_nodes) - 1
+            if has_children:
+                _flatten(data["children"], current_idx, level + 1, f"{node.path}/")
+
+    _flatten(tree, -1, 0, "")
+
+
+def _find_tree_node_for_entry(operator, entry_index: int) -> int:
+    for idx, node in enumerate(operator.pak_tree_nodes):
+        if not node.is_directory and node.entry_index == entry_index:
+            return idx
+    return -1
+
+
+def _set_active_entry(operator, entry_index: int) -> None:
+    if 0 <= entry_index < len(operator.pak_entries):
+        operator.pak_active_index = entry_index
+        operator.archive_entry = operator.pak_entries[entry_index].name
+        operator.pak_tree_active_index = _find_tree_node_for_entry(operator, entry_index)
+    else:
+        operator.pak_active_index = -1
+        operator.pak_tree_active_index = -1
+
+
+def _on_tree_selection_changed(self, _context):
+    if not self.pak_tree_nodes:
+        return
+    index = self.pak_tree_active_index
+    if 0 <= index < len(self.pak_tree_nodes):
+        node = self.pak_tree_nodes[index]
+        if not node.is_directory and 0 <= node.entry_index < len(self.pak_entries):
+            self.pak_active_index = node.entry_index
+            self.archive_entry = self.pak_entries[node.entry_index].name
+
+
+
 def _refresh_pak_entries(self, _context):  # pragma: no cover - UI callback
     if self.filepath.lower().endswith(".pak"):
-        self._load_pak_entries()
+        _load_pak_entries(self)
 
 
-class HAVOK_UL_pak_entries(bpy.types.UIList):
-    bl_idname = "HAVOK_UL_pak_entries"
+class HAVOK_UL_pak_tree(bpy.types.UIList):
+    bl_idname = "HAVOK_UL_pak_tree"
 
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname):  # pragma: no cover - UI
-        if self.layout_type in {"DEFAULT", "COMPACT"}:
-            layout.label(text=item.name, icon="FILE_ARCHIVE")
-            layout.label(text=f"{item.size} bytes")
-            layout.label(text=item.mode)
-        elif self.layout_type == "GRID":
-            layout.alignment = "CENTER"
-            layout.label(text=item.name)
+        row = layout.row(align=True)
+        if item.level > 0:
+            indent = row.row(align=True)
+            indent.enabled = False
+            indent.label(text="    " * item.level)
+        if item.is_directory:
+            icon = "TRIA_DOWN" if item.expanded else "TRIA_RIGHT"
+            row.prop(item, "expanded", text="", icon=icon, emboss=False)
+            row.label(text=item.name, icon="FILE_FOLDER")
+            row.label(text="", icon="BLANK1")
+            row.label(text="")
+        else:
+            row.label(text="", icon="BLANK1")
+            row.label(text=item.name, icon="FILE")
+            row.label(text=f"{item.size} bytes")
+            row.label(text=item.mode)
+
+    def filter_items(self, _context, data, propname):
+        collection = getattr(data, propname)
+        flags = [self.bitflag_filter_item] * len(collection)
+        for idx, node in enumerate(collection):
+            parent_idx = node.parent_index
+            visible = True
+            while parent_idx >= 0:
+                parent = collection[parent_idx]
+                if parent.is_directory and not parent.expanded:
+                    visible = False
+                    break
+                parent_idx = parent.parent_index
+            if not visible:
+                flags[idx] = 0
+        return flags, []
 
 
 class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
@@ -56,6 +189,8 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     )
 
     pak_entries: bpy.props.CollectionProperty(type=HavokPakEntry)
+    pak_tree_nodes: bpy.props.CollectionProperty(type=HavokPakTreeNode)
+    pak_tree_active_index: bpy.props.IntProperty(default=-1, update=_on_tree_selection_changed)
     pak_active_index: bpy.props.IntProperty()
     last_pak_path: bpy.props.StringProperty(options={"HIDDEN"})
 
@@ -103,7 +238,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
     def check(self, _context):  # pragma: no cover - UI callback
         if self.filepath.lower().endswith(".pak") and self.filepath != self.last_pak_path:
-            self._load_pak_entries()
+            _load_pak_entries(self)
             self.last_pak_path = self.filepath
             return True
         return False
@@ -156,12 +291,12 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             layout.prop(self, "pak_platform")
             row = layout.row()
             row.template_list(
-                "HAVOK_UL_pak_entries",
-                "pak_entries",
+                "HAVOK_UL_pak_tree",
+                "pak_tree",
                 self,
-                "pak_entries",
+                "pak_tree_nodes",
                 self,
-                "pak_active_index",
+                "pak_tree_active_index",
                 rows=5,
             )
 
@@ -201,29 +336,6 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             pose_bone.rotation_quaternion = bone.rotation
 
         return armature_obj
-
-    def _load_pak_entries(self) -> None:
-        self.pak_entries.clear()
-        if not self.filepath:
-            return
-        try:
-            entries = parsers.enumerate_pak_entries(
-                Path(self.filepath), self.pak_profile, self.pak_platform
-            )
-        except Exception:
-            return
-
-        for entry in entries:
-            item = self.pak_entries.add()
-            item.name = entry.name
-            item.size = entry.size
-            item.mode = hex(entry.mode)
-        if entries:
-            self.archive_entry = entries[0].name
-            self.pak_active_index = 0
-        else:
-            self.archive_entry = ""
-            self.pak_active_index = 0
 
     def _build_animations(
         self,

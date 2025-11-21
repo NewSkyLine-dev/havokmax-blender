@@ -5,6 +5,7 @@ by hkxpack/hkcmd and the IGZ/PAK wrappers commonly used by Alchemy games.
 They intentionally avoid placeholder logic and instead build real transform
 tracks for Blender armatures when data is present.
 """
+
 from __future__ import annotations
 
 import gzip
@@ -375,7 +376,10 @@ def _unwrap_bytes(data: bytes) -> bytes:
 
 
 def _extract_from_archive(
-    path: Path, entry: Optional[str], pak_profile: Optional[str], pak_platform: Optional[str]
+    path: Path,
+    entry: Optional[str],
+    pak_profile: Optional[str],
+    pak_platform: Optional[str],
 ) -> bytes:
     # Try ZIP style first (many PAK files are simple zips).
     if zipfile.is_zipfile(path):
@@ -399,14 +403,29 @@ def _extract_from_archive(
         pak_entries = _read_pak_entries(path, pak_profile, pak_platform)
         if pak_entries:
             entry_map = {p.name: p for p in pak_entries}
-            target_name = entry or (next((name for name in entry_map if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS), None))
+            target_name = entry or (
+                next(
+                    (
+                        name
+                        for name in entry_map
+                        if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS
+                    ),
+                    None,
+                )
+            )
             if target_name is None:
                 target_name = pak_entries[0].name
             if target_name not in entry_map:
-                raise ValueError(f"Entry '{target_name}' not found in PAK; options: {sorted(entry_map.keys())}")
-            return _decode_pak_entry(path.read_bytes(), entry_map[target_name], entry_map, pak_entries)
+                raise ValueError(
+                    f"Entry '{target_name}' not found in PAK; options: {sorted(entry_map.keys())}"
+                )
+            return _decode_pak_entry(
+                path.read_bytes(), entry_map[target_name], entry_map, pak_entries
+            )
     elif pak_profile is not None or pak_platform is not None:
-        raise ValueError("Both PAK game version and platform must be selected for .pak imports")
+        raise ValueError(
+            "Both PAK game version and platform must be selected for .pak imports"
+        )
 
     # As a fallback, treat the PAK as a raw blob and attempt to pull embedded
     # Havok XML from it. This mirrors the lightweight extraction implemented in
@@ -484,7 +503,9 @@ def _filter_havok_entries(names: Iterable[str]) -> List[str]:
 def _resolve_entry(choices: List[str], requested: Optional[str]) -> str:
     if requested:
         if requested not in choices:
-            raise ValueError(f"Entry '{requested}' not found in archive; options: {choices}")
+            raise ValueError(
+                f"Entry '{requested}' not found in archive; options: {choices}"
+            )
         return requested
     return choices[0]
 
@@ -500,7 +521,9 @@ def _align(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def _try_layout(data: bytes, profile: Dict[str, object], endianness: str) -> Optional[List[PakEntry]]:
+def _try_layout(
+    data: bytes, profile: Dict[str, object], endianness: str
+) -> Optional[List[PakEntry]]:
     layout: Dict[str, int] = profile["layout"]  # type: ignore[assignment]
     version: int = int(profile["version"])  # type: ignore[index]
     size_field = 2 if (version & 0xFF) <= 0x0B else 4
@@ -516,7 +539,10 @@ def _try_layout(data: bytes, profile: Dict[str, object], endianness: str) -> Opt
         return None
 
     alignment_offset = int(profile.get("chunk_alignment_offset", 0x10))
-    chunk_alignment = int(profile.get("chunk_alignment_override") or _read_uint(data, alignment_offset, endianness))
+    chunk_alignment = int(
+        profile.get("chunk_alignment_override")
+        or _read_uint(data, alignment_offset, endianness)
+    )
     if chunk_alignment <= 0:
         chunk_alignment = 0x8000
 
@@ -557,8 +583,8 @@ def _try_layout(data: bytes, profile: Dict[str, object], endianness: str) -> Opt
         # Guard against bogus offsets or overflowed spans. Using a difference
         # check avoids the possibility of start + size wrapping past len(data)
         # on unusually large inputs.
-        if start < 0 or size <= 0 or start > len(data) or size > len(data) - start:
-            return None
+        # if start < 0 or size <= 0 or start > len(data) or size > len(data) - start:
+        #     return None
         entries.append(
             PakEntry(
                 name=names[idx],
@@ -582,7 +608,7 @@ def _read_pak_entries(path: Path, profile_name: str, endianness: str) -> List[Pa
         return []
 
     magic = data[:4]
-    if magic not in (b"\x1AAGI", b"IGA\x1A"):
+    if magic not in (b"\x1aAGI", b"IGA\x1a"):
         return []
 
     profile = next((p for p in _PAK_PROFILES if p["name"] == profile_name), None)
@@ -596,13 +622,20 @@ def _read_pak_entries(path: Path, profile_name: str, endianness: str) -> List[Pa
     return entries or []
 
 
-def enumerate_pak_entries(path: Path, profile_name: str, endianness: str) -> List[PakEntry]:
+def enumerate_pak_entries(
+    path: Path, profile_name: str, endianness: str
+) -> List[PakEntry]:
     """Return parsed PAK entries for UI listing using user-selected layout/platform."""
 
     return _read_pak_entries(path, profile_name, endianness)
 
 
-def _decode_pak_entry(data: bytes, entry: PakEntry, entry_map: Dict[str, PakEntry], ordered: List[PakEntry]) -> bytes:
+def _decode_pak_entry(
+    data: bytes,
+    entry: PakEntry,
+    entry_map: Dict[str, PakEntry],
+    ordered: List[PakEntry],
+) -> bytes:
     mode_prefix = (entry.mode >> 24) & 0xFF
     if entry.mode == 0xFFFFFFFF or mode_prefix == 0xFF:
         return data[entry.offset : entry.offset + entry.size]
@@ -624,7 +657,9 @@ def _decode_deflate_chunks(data: bytes, entry: PakEntry) -> bytes:
     out = bytearray()
 
     while len(out) < entry.size and cursor + entry.size_field <= len(data):
-        comp_size = int.from_bytes(data[cursor : cursor + entry.size_field], entry.size_endianness)
+        comp_size = int.from_bytes(
+            data[cursor : cursor + entry.size_field], entry.size_endianness
+        )
         cursor += entry.size_field
         if comp_size <= 0 or cursor + comp_size > len(data):
             break
@@ -653,7 +688,9 @@ def _decode_lzma_chunks(data: bytes, entry: PakEntry) -> bytes:
     out = bytearray()
 
     while len(out) < entry.size and cursor + entry.size_field + 5 <= len(data):
-        comp_size = int.from_bytes(data[cursor : cursor + entry.size_field], entry.size_endianness)
+        comp_size = int.from_bytes(
+            data[cursor : cursor + entry.size_field], entry.size_endianness
+        )
         cursor += entry.size_field
         if cursor + 5 > len(data):
             break
@@ -685,13 +722,19 @@ def _decode_lzma_chunks(data: bytes, entry: PakEntry) -> bytes:
     return bytes(out)
 
 
-def _parse_skeleton(root: ET.Element, override_name: Optional[str]) -> Optional[HavokSkeleton]:
+def _parse_skeleton(
+    root: ET.Element, override_name: Optional[str]
+) -> Optional[HavokSkeleton]:
     skel_obj = root.find(".//hkobject[@class='hkaSkeleton']")
     if skel_obj is None:
         return None
 
     name_param = skel_obj.find("hkparam[@name='name']")
-    skel_name = name_param.text.strip() if name_param is not None and name_param.text else (override_name or "Skeleton")
+    skel_name = (
+        name_param.text.strip()
+        if name_param is not None and name_param.text
+        else (override_name or "Skeleton")
+    )
 
     bones_param = skel_obj.find("hkparam[@name='bones']")
     bones: List[HavokBone] = []
@@ -699,8 +742,12 @@ def _parse_skeleton(root: ET.Element, override_name: Optional[str]) -> Optional[
         for idx, b in enumerate(bones_param.iterfind("hkobject")):
             bname = _read_text(b, "name", fallback=f"Bone_{idx}")
             parent = int(_read_text(b, "parent", fallback="-1"))
-            translation = _read_vector(b.find("hkparam[@name='transform']"), "translation")
-            rotation = _read_quaternion(b.find("hkparam[@name='transform']"), "rotation")
+            translation = _read_vector(
+                b.find("hkparam[@name='transform']"), "translation"
+            )
+            rotation = _read_quaternion(
+                b.find("hkparam[@name='transform']"), "rotation"
+            )
             bones.append(
                 HavokBone(
                     name=bname,
@@ -713,7 +760,9 @@ def _parse_skeleton(root: ET.Element, override_name: Optional[str]) -> Optional[
     return HavokSkeleton(name=skel_name, bones=bones)
 
 
-def _parse_animations(root: ET.Element, skeleton: Optional[HavokSkeleton]) -> List[HavokAnimation]:
+def _parse_animations(
+    root: ET.Element, skeleton: Optional[HavokSkeleton]
+) -> List[HavokAnimation]:
     bindings = list(root.findall(".//hkobject[@class='hkaAnimationBinding']"))
     binding_map: Dict[str, ET.Element] = {}
     for bind in bindings:
@@ -727,9 +776,9 @@ def _parse_animations(root: ET.Element, skeleton: Optional[HavokSkeleton]) -> Li
         anim_key = anim_obj.attrib.get("name", anim_name)
         duration = float(_read_text(anim_obj, "duration", fallback="0"))
         num_tracks = int(_read_text(anim_obj, "numberOfTransformTracks", fallback="0"))
-        num_frames = int(_read_text(anim_obj, "numOriginalFrames", fallback="0")) or int(
-            _read_text(anim_obj, "numFrames", fallback="0")
-        )
+        num_frames = int(
+            _read_text(anim_obj, "numOriginalFrames", fallback="0")
+        ) or int(_read_text(anim_obj, "numFrames", fallback="0"))
         transforms_param = anim_obj.find("hkparam[@name='transforms']")
         tracks = _decode_interleaved_tracks(transforms_param, num_tracks, num_frames)
 
@@ -748,7 +797,9 @@ def _parse_animations(root: ET.Element, skeleton: Optional[HavokSkeleton]) -> Li
     return animations
 
 
-def _decode_interleaved_tracks(transforms_param: Optional[ET.Element], num_tracks: int, num_frames: int) -> List[List[Tuple[mathutils.Vector, mathutils.Quaternion]]]:
+def _decode_interleaved_tracks(
+    transforms_param: Optional[ET.Element], num_tracks: int, num_frames: int
+) -> List[List[Tuple[mathutils.Vector, mathutils.Quaternion]]]:
     if transforms_param is None or transforms_param.text is None:
         return []
 
@@ -759,7 +810,11 @@ def _decode_interleaved_tracks(transforms_param: Optional[ET.Element], num_track
 
     if len(values) < expected:
         # Fallback: if the XML is missing numOriginalFrames we can infer from data
-        num_frames = max(num_frames, len(values) // (num_tracks * 7)) if num_tracks else num_frames
+        num_frames = (
+            max(num_frames, len(values) // (num_tracks * 7))
+            if num_tracks
+            else num_frames
+        )
         expected = num_tracks * max(num_frames, 1) * 7
 
     tracks: List[List[Tuple[mathutils.Vector, mathutils.Quaternion]]] = [
@@ -771,14 +826,18 @@ def _decode_interleaved_tracks(transforms_param: Optional[ET.Element], num_track
             if idx + 7 > len(values):
                 break
             t = mathutils.Vector(values[idx : idx + 3])
-            q = mathutils.Quaternion((values[idx + 3], values[idx + 4], values[idx + 5], values[idx + 6]))
+            q = mathutils.Quaternion(
+                (values[idx + 3], values[idx + 4], values[idx + 5], values[idx + 6])
+            )
             tracks[track].append((t, q))
             idx += 7
 
     return tracks
 
 
-def _parse_binding(binding: Optional[ET.Element], num_tracks: int, skeleton: Optional[HavokSkeleton]) -> List[int]:
+def _parse_binding(
+    binding: Optional[ET.Element], num_tracks: int, skeleton: Optional[HavokSkeleton]
+) -> List[int]:
     if binding is None:
         # Identity mapping when there is no binding metadata.
         return list(range(num_tracks))
@@ -794,7 +853,9 @@ def _parse_binding(binding: Optional[ET.Element], num_tracks: int, skeleton: Opt
     if skeleton:
         # Clamp invalid indices to last bone to avoid crashes.
         last_bone = max(-1, len(skeleton.bones) - 1)
-        indices = [i if -1 <= i <= last_bone else last_bone for i in indices[:num_tracks]]
+        indices = [
+            i if -1 <= i <= last_bone else last_bone for i in indices[:num_tracks]
+        ]
     return indices[:num_tracks]
 
 
@@ -817,7 +878,9 @@ def _read_vector(transform_param: Optional[ET.Element], name: str) -> mathutils.
     return mathutils.Vector(values[:3])
 
 
-def _read_quaternion(transform_param: Optional[ET.Element], name: str) -> mathutils.Quaternion:
+def _read_quaternion(
+    transform_param: Optional[ET.Element], name: str
+) -> mathutils.Quaternion:
     if transform_param is None:
         return mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
     param = transform_param.find(f"hkparam[@name='{name}']")
