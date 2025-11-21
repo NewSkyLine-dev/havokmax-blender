@@ -1,32 +1,44 @@
-This repo has been archived, because it's no longer possible to do development due to licensing issues within 3ds max (among other problems).
+# Havok IO (Blender 5.0)
 
-For exhausting explanation, head to [my blog post about those issues](https://lukascone.wordpress.com/2021/06/07/da-futureh/).
+A Blender add-on that replaces the archived HavokMax 3ds Max plugin. The port
+adds Blender-native import entries for Havok `.hkx`, `.hkt`, `.hka`, `.igz`,
+and `.pak` containers, plus configuration options that mirror the original
+tool's presets.
 
-Further development/releases will be available in [HavokToolset](https://github.com/PredatorCZ/HavokLib/tree/master/toolset) subproject for HavokLib.
-
-# HavokMax
-
-HavokMax is Havok importer/exporter for 3ds max.\
-Buildable with VS2017.\
-Supported 3ds max versions: **2010 - 2022**\
-Tested on 3ds max versions: **2017**
-
-## Building
-
-Head to the [Building a 3ds max CMake projects](https://github.com/PredatorCZ/PreCore/wiki/Building-a-3ds-max-CMake-projects) wiki page.
+> **Status:** The importer now reads Havok XML packfiles directly, building real
+> armatures and keyframed actions when animation data is present.
 
 ## Installation
 
-### [Latest Release](https://github.com/PredatorCZ/HavokMax/releases/)
+1. Download or clone this repository.
+2. From Blender **Edit → Preferences → Add-ons → Install…**, select the project
+   directory (the folder containing `manifest.toml`).
+3. Enable **Havok IO** in the add-on list.
 
-Move corresponding .dlu located in correct version folder into ***%3ds max installation directory%/plugins***. \
-Versions must match!\
-Additionally plugin will require **Visual C++ Redistributable for Visual Studio 2017** to be installed in order to work.
+## Usage
+
+- **Import:** `File → Import → Havok (.hkx/.hkt/.hka/.igz/.pak)` will unpack
+  compressed IGZ payloads, scan PAK containers (zip, tar, or raw blobs) for
+  Havok XML, and build an armature plus animation actions. PAK files optionally
+  accept an entry path via the importer UI.
+- **Presets:** Configure scale and up/forward axes in **Preferences → Add-ons →
+  Havok IO** or in the 3D View **Havok** side panel.
+
+## Development
+
+The add-on uses Blender's new `manifest.toml` packaging format (introduced for
+Blender 4.2+ and forward-compatible with Blender 5.0). Source files live in the
+`havok_blender/` package:
+
+- `operators/` contains the import operator and shared preferences.
+- `ui/` defines the 3D View toolbar panel.
+
+To validate basic syntax without Blender:
+
+```bash
+python -m compileall havok_blender
+```
 
 ## License
 
-This plugin is available under GPL v3 license. (See LICENSE.md)
-
-This plugin uses following libraries:
-
-* HavokLib, Copyright (c) 2016-2020 Lukas Cone
+Havok IO is available under the GPL v3 license (see `LICENSE`).
