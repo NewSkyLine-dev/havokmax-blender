@@ -383,12 +383,18 @@ def _read_pak_entries(path: Path) -> List[PakEntry]:
     magic = data[:4]
     if magic not in (b"\x1AAGI", b"IGA\x1A"):
         return []
-    endianness = "little" if magic == b"\x1AAGI" else "big"
 
-    for layout in _PAK_LAYOUTS.values():
-        entries = _try_layout(data, layout, endianness)
-        if entries:
-            return entries
+    # Some dumps flip the endianness flag without altering the header
+    # ordering. To avoid dropping valid archives, try both byte orders even
+    # if the signature suggests one.
+    preferred = "little" if magic == b"\x1AAGI" else "big"
+    fallbacks = [preferred, "big" if preferred == "little" else "little"]
+
+    for endianness in fallbacks:
+        for layout in _PAK_LAYOUTS.values():
+            entries = _try_layout(data, layout, endianness)
+            if entries:
+                return entries
     return []
 
 
