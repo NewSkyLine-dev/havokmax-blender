@@ -326,25 +326,24 @@ def _read_uint(data: bytes, offset: int, endianness: str) -> int:
 
 def _try_layout(data: bytes, layout: Dict[str, int], endianness: str) -> Optional[List[PakEntry]]:
     num_files = _read_uint(data, layout["num_files"], endianness)
-    if num_files <= 0 or num_files > 10_000:
+    if num_files <= 0 or num_files > 0xFFFF:
         return None
 
-    name_loc = layout["name_loc"]
-    name_len = layout["name_len"]
-    name_table_end = name_loc + _read_uint(data, name_len, endianness)
-    if name_table_end > len(data):
+    nametable_loc = _read_uint(data, layout["name_loc"], endianness)
+    nametable_len = _read_uint(data, layout["name_len"], endianness)
+    if nametable_loc + nametable_len > len(data):
         return None
 
     names: List[str] = []
     for idx in range(num_files):
-        offset_ptr = name_loc + 4 * idx
+        offset_ptr = nametable_loc + 4 * idx
         if offset_ptr + 4 > len(data):
             return None
         name_offset = _read_uint(data, offset_ptr, endianness)
-        start = name_loc + name_offset
-        if start >= len(data):
+        start = nametable_loc + name_offset
+        if start >= nametable_loc + nametable_len:
             return None
-        end = data.find(b"\x00", start, len(data))
+        end = data.find(b"\x00", start, nametable_loc + nametable_len)
         if end == -1:
             return None
         try:
@@ -359,16 +358,17 @@ def _try_layout(data: bytes, layout: Dict[str, int], endianness: str) -> Optiona
     file_size_in_local = layout["file_size_in_local"]
     mode_in_local = layout["mode_in_local"]
 
-    entries: List[PakEntry] = []
     base_header = checksum_loc + checksum_len * num_files
+    if base_header + local_header_len * num_files > len(data):
+        return None
+
+    entries: List[PakEntry] = []
     for idx in range(num_files):
         header_base = base_header + local_header_len * idx
-        if header_base + max(file_start_in_local, file_size_in_local, mode_in_local) + 4 > len(data):
-            return None
         start = _read_uint(data, header_base + file_start_in_local, endianness)
         size = _read_uint(data, header_base + file_size_in_local, endianness)
         mode = _read_uint(data, header_base + mode_in_local, endianness)
-        if start >= len(data) or size <= 0:
+        if start >= len(data) or size <= 0 or start + size > len(data):
             return None
         entries.append(PakEntry(name=names[idx], offset=start, size=size, mode=mode, endianness=endianness))
 
