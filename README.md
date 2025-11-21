@@ -5,9 +5,9 @@ adds Blender-native import entries for Havok `.hkx`, `.hkt`, `.hka`, `.igz`,
 and `.pak` containers, plus configuration options that mirror the original
 tool's presets.
 
-> **Status:** The importer now reads Havok XML packfiles directly (and can call
-> the optional HavokLib `havokpy` module to unwrap binary HKX/HKA/HKT files),
-> building real armatures and keyframed actions when animation data is present.
+> **Status:** The importer now reads Havok XML packfiles directly and bundles a
+> pure-Python HavokLib port to unwrap binary HKX/HKA/HKT files, building real
+> armatures and keyframed actions when animation data is present.
 
 ## Installation
 
@@ -29,24 +29,11 @@ tool's presets.
 
 ### Binary HKX/HKT/HKA support
 
-The Blender add-on ships with pure-Python parsers for Havok XML. To support
-binary-only packfiles (as used by Havok 2011–2014), build and install the
-`havokpy` module from the original HavokLib project:
-
-```bash
-git clone https://github.com/PredatorCZ/HavokLib.git
-cd HavokLib
-cmake -S python -B build
-cmake --build build --config Release
-pip install ./build/python_module/lib
-```
-
-When `havokpy` is present, the importer will automatically convert binary
-packfiles to XML before creating Blender armatures and actions.
-
-The add-on will also search for a bundled `havokpy` next to
-`3rd_party/HavokLib` inside the add-on folder, so you can copy the compiled
-module there if you prefer not to install it globally.
+The Blender add-on ships with pure-Python parsers for Havok XML and a small
+Python port of HavokLib's packfile reader. The port understands the classic
+`hkxHeader` layout and the newer `TAG0` chunked containers, peeling out any
+compressed XML so the importer can continue without an external wheel. No
+additional dependencies are required.
 
 ## Development
 
