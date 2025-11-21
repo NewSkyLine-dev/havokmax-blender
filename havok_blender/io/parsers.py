@@ -18,6 +18,8 @@ import xml.etree.ElementTree as ET
 
 import mathutils
 
+from .havoklib_bridge import convert_bytes_to_xml, convert_packfile_to_xml
+
 SUPPORTED_EXTENSIONS = {".hkx", ".hka", ".hkt", ".igz", ".pak"}
 
 
@@ -63,6 +65,10 @@ def load_from_path(path: Path, entry: Optional[str] = None) -> HavokPack:
     else:
         data = path.read_bytes()
 
+    converted = convert_packfile_to_xml(path)
+    if converted:
+        data = converted
+
     return parse_bytes(data, override_name=path.stem)
 
 
@@ -93,6 +99,10 @@ def _unwrap_bytes(data: bytes) -> bytes:
     igz_payload = _maybe_from_igz(data)
     if igz_payload is not None:
         return igz_payload
+
+    converted = convert_bytes_to_xml(data)
+    if converted is not None:
+        return converted
 
     embedded = _slice_embedded_havok(data)
     if embedded is not None:
