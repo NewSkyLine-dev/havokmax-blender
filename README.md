@@ -7,7 +7,9 @@ tool's presets.
 
 > **Status:** The importer now reads Havok XML packfiles directly and mirrors the
 > igArchiveExtractor logic to unwrap PAK/IGZ archives while building real
-> armatures and keyframed actions when animation data is present.
+> armatures and keyframed actions when animation data is present. IGZ files are
+> parsed with the io_scene_igz-style fixup walker so NHMT memory blocks are
+> resolved before scanning for Havok XML or compressed payloads.
 
 ## Installation
 

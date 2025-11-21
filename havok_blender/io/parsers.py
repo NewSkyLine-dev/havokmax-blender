@@ -195,6 +195,122 @@ class PakEntry:
     size_endianness: str
 
 
+class _IgzStream:
+    """Lightweight binary reader inspired by io_scene_igz's NoeBitStream."""
+
+    def __init__(self, data: bytes, endianness: str):
+        self.data = data
+        self.order = "little" if endianness == "little" else "big"
+
+    def u16(self, offset: int) -> int:
+        return int.from_bytes(self.data[offset : offset + 2], self.order)
+
+    def u32(self, offset: int) -> int:
+        return int.from_bytes(self.data[offset : offset + 4], self.order)
+
+    def u64(self, offset: int) -> int:
+        return int.from_bytes(self.data[offset : offset + 8], self.order)
+
+
+class _IgzExtractor:
+    """Parse IGZ fixup tables to recover embedded Havok payloads.
+
+    This mirrors the layout walking in NewSkyLine-dev/io_scene_igz without
+    pulling in the full model importer. It focuses on the fixup sections that
+    reference arbitrary memory blobs (NHMT) so we can scan them for Havok XML
+    or compressed packfiles.
+    """
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.blocks: List[bytes] = []
+        self.endianness = "little"
+        self.version = 0
+        self.pointers: List[int] = []
+
+    def parse(self) -> List[bytes]:
+        if len(self.data) < 0x20:
+            return []
+
+        magic = self.data[:4]
+        if magic == b"\x01ZGI":
+            self.endianness = "little"
+        elif magic == b"IGZ\x01":
+            self.endianness = "big"
+        else:
+            return []
+
+        stream = _IgzStream(self.data, self.endianness)
+        self.version = stream.u32(4)
+
+        pointer_start = 0x18 if self.version >= 0x07 else 0x10
+        num_fixups = stream.u32(0x14) if self.version >= 0x07 else -1
+
+        for idx in range(0x20):
+            ptr = stream.u32(pointer_start + idx * 0x10)
+            if ptr == 0:
+                break
+            self.pointers.append(ptr)
+
+        if not self.pointers:
+            return []
+
+        fixup_start = self.pointers[0]
+        if self.version <= 0x06:
+            platform = stream.u16(fixup_start + 0x08)
+            _ = platform  # platform is not needed for extraction
+            num_fixups = stream.u32(fixup_start + 0x10)
+            fixup_start += 0x1C
+
+        cursor = fixup_start
+        for _ in range(max(num_fixups, 0)):
+            if cursor + 0x10 > len(self.data):
+                break
+            magic = stream.u32(cursor)
+            local_cursor = cursor + (0x0C if self.version <= 0x06 else 0x04)
+            count = stream.u32(local_cursor)
+            length = stream.u32(local_cursor + 4)
+            data_start = stream.u32(local_cursor + 8)
+            payload_cursor = cursor + data_start
+
+            if magic in (0x4E484D54, 10):
+                self._read_memory_blocks(stream, payload_cursor, count)
+
+            cursor += length if length > 0 else 0x10
+
+        return self.blocks
+
+    def _fix_pointer(self, pointer: int) -> int:
+        if pointer & 0x80000000:
+            return -1
+        if self.version <= 0x06:
+            base_index = (pointer >> 0x18) + 1
+            offset = pointer & 0x00FFFFFF
+        else:
+            base_index = (pointer >> 0x1B) + 1
+            offset = pointer & 0x07FFFFFF
+        if base_index >= len(self.pointers):
+            return -1
+        return self.pointers[base_index] + offset
+
+    def _read_pointer(self, stream: _IgzStream, offset: int) -> Tuple[int, int]:
+        ptr = stream.u32(offset)
+        return self._fix_pointer(ptr), 4
+
+    def _read_memory_blocks(self, stream: _IgzStream, cursor: int, count: int) -> None:
+        for _ in range(count):
+            if cursor + 8 > len(self.data):
+                break
+            size = stream.u32(cursor) & 0x00FFFFFF
+            pointer_offset, consumed = self._read_pointer(stream, cursor + 4)
+            cursor += 4 + consumed
+            if pointer_offset == -1 or size <= 0:
+                continue
+            if pointer_offset + size > len(self.data):
+                continue
+            self.blocks.append(self.data[pointer_offset : pointer_offset + size])
+
+
 def load_from_path(path: Path, entry: Optional[str] = None) -> HavokPack:
     """Load any supported Havok source from disk.
 
@@ -293,33 +409,38 @@ def _maybe_from_igz(data: bytes) -> Optional[bytes]:
     """Attempt to extract Havok XML out of an IGZ container.
 
     IGZ files used by Alchemy titles wrap their assets with a small header and
-    one or more compressed blocks. To avoid re-implementing the full Noesis
-    parser, we reuse the community technique of scanning for compressed streams
-    and Havok XML markers.
+    one or more fixup-defined memory blocks. We mirror the io_scene_igz
+    importer: parse the fixup table, resolve NHMT memory references, then scan
+    each block for Havok XML or compressed data.
     """
 
     if not (data.startswith(b"\x01ZGI") or data.startswith(b"IGZ\x01")):
         return None
 
-    # 1) Look for inline gzip members.
-    gzip_idx = data.find(b"\x1f\x8b")
-    if gzip_idx != -1:
-        try:
-            return gzip.decompress(data[gzip_idx:])
-        except OSError:
-            pass
+    extractor = _IgzExtractor(data)
+    blocks = extractor.parse()
+    candidates = list(blocks)
+    candidates.append(data)
 
-    # 2) Search for common zlib headers, as used by Skylanders IGZ payloads.
-    for sig in (b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
-        z_idx = data.find(sig)
-        if z_idx != -1:
+    for blob in candidates:
+        # Inline gzip or zlib members.
+        if blob.startswith(b"\x1f\x8b"):
             try:
-                return zlib.decompress(data[z_idx:])
-            except zlib.error:
-                continue
+                return gzip.decompress(blob)
+            except OSError:
+                pass
+        for sig in (b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
+            if blob.startswith(sig):
+                try:
+                    return zlib.decompress(blob)
+                except zlib.error:
+                    pass
 
-    # 3) If compression markers are absent, fall back to slicing out the XML.
-    return _slice_embedded_havok(data)
+        sliced = _slice_embedded_havok(blob)
+        if sliced:
+            return sliced
+
+    return None
 
 
 def _slice_embedded_havok(blob: bytes) -> Optional[bytes]:
