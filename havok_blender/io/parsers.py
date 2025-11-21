@@ -19,100 +19,139 @@ import xml.etree.ElementTree as ET
 
 import mathutils
 
-from .havoklib_bridge import convert_bytes_to_xml, convert_packfile_to_xml
-
 SUPPORTED_EXTENSIONS = {".hkx", ".hka", ".hkt", ".igz", ".pak"}
 
-_PAK_LAYOUTS: Dict[str, Dict[str, int]] = {
-    "SSA_WII": {
-        "num_files": 0x0C,
-        "name_loc": 0x18,
-        "name_len": 0x1C,
-        "local_header_len": 0x0C,
-        "checksum_loc": 0x30,
-        "checksum_len": 0x04,
-        "file_start_in_local": 0x00,
-        "file_size_in_local": 0x04,
-        "mode_in_local": 0x08,
+_PAK_PROFILES = [
+    {
+        "name": "SSA_WII",
+        "version": 0x04,
+        "chunk_alignment_offset": 0x10,
+        "chunk_alignment_override": 0x800,
+        "layout": {
+            "num_files": 0x0C,
+            "name_loc": 0x18,
+            "name_len": 0x1C,
+            "local_header_len": 0x0C,
+            "checksum_loc": 0x30,
+            "checksum_len": 0x04,
+            "file_start_in_local": 0x00,
+            "file_size_in_local": 0x04,
+            "mode_in_local": 0x08,
+        },
     },
-    "SSA_WIIU": {
-        "num_files": 0x0C,
-        "name_loc": 0x1C,
-        "name_len": 0x20,
-        "local_header_len": 0x0C,
-        "checksum_loc": 0x34,
-        "checksum_len": 0x04,
-        "file_start_in_local": 0x00,
-        "file_size_in_local": 0x04,
-        "mode_in_local": 0x08,
+    {
+        "name": "SSA_WIIU",
+        "version": 0x08,
+        "chunk_alignment_offset": 0x10,
+        "layout": {
+            "num_files": 0x0C,
+            "name_loc": 0x1C,
+            "name_len": 0x20,
+            "local_header_len": 0x0C,
+            "checksum_loc": 0x34,
+            "checksum_len": 0x04,
+            "file_start_in_local": 0x00,
+            "file_size_in_local": 0x04,
+            "mode_in_local": 0x08,
+        },
     },
-    "SWAP_FORCE": {
-        "num_files": 0x0C,
-        "name_loc": 0x2C,
-        "name_len": 0x30,
-        "local_header_len": 0x10,
-        "checksum_loc": 0x38,
-        "checksum_len": 0x04,
-        "file_start_in_local": 0x04,
-        "file_size_in_local": 0x08,
-        "mode_in_local": 0x0C,
+    {
+        "name": "SWAP_FORCE",
+        "version": 0x0A,
+        "chunk_alignment_offset": 0x10,
+        "layout": {
+            "num_files": 0x0C,
+            "name_loc": 0x2C,
+            "name_len": 0x30,
+            "local_header_len": 0x10,
+            "checksum_loc": 0x38,
+            "checksum_len": 0x04,
+            "file_start_in_local": 0x04,
+            "file_size_in_local": 0x08,
+            "mode_in_local": 0x0C,
+        },
     },
-    "LOST_ISLANDS": {
-        "num_files": 0x0C,
-        "name_loc": 0x28,
-        "name_len": 0x30,
-        "local_header_len": 0x10,
-        "checksum_loc": 0x38,
-        "checksum_len": 0x04,
-        "file_start_in_local": 0x00,
-        "file_size_in_local": 0x08,
-        "mode_in_local": 0x0C,
+    {
+        "name": "LOST_ISLANDS",
+        "version": 0x0A,
+        "chunk_alignment_offset": 0x10,
+        "layout": {
+            "num_files": 0x0C,
+            "name_loc": 0x28,
+            "name_len": 0x30,
+            "local_header_len": 0x10,
+            "checksum_loc": 0x38,
+            "checksum_len": 0x04,
+            "file_start_in_local": 0x00,
+            "file_size_in_local": 0x08,
+            "mode_in_local": 0x0C,
+        },
     },
-    "TRAP_TEAM": {
-        "num_files": 0x0C,
-        "name_loc": 0x28,
-        "name_len": 0x30,
-        "local_header_len": 0x10,
-        "checksum_loc": 0x38,
-        "checksum_len": 0x04,
-        "file_start_in_local": 0x00,
-        "file_size_in_local": 0x08,
-        "mode_in_local": 0x0C,
+    {
+        "name": "TRAP_TEAM",
+        "version": 0x0B,
+        "chunk_alignment_offset": 0x10,
+        "layout": {
+            "num_files": 0x0C,
+            "name_loc": 0x28,
+            "name_len": 0x30,
+            "local_header_len": 0x10,
+            "checksum_loc": 0x38,
+            "checksum_len": 0x04,
+            "file_start_in_local": 0x00,
+            "file_size_in_local": 0x08,
+            "mode_in_local": 0x0C,
+        },
     },
-    "SUPER_CHARGERS": {
-        "num_files": 0x0C,
-        "name_loc": 0x2C,
-        "name_len": 0x30,
-        "local_header_len": 0x10,
-        "checksum_loc": 0x38,
-        "checksum_len": 0x04,
-        "file_start_in_local": 0x04,
-        "file_size_in_local": 0x08,
-        "mode_in_local": 0x0C,
+    {
+        "name": "SUPER_CHARGERS",
+        "version": 0x0B,
+        "chunk_alignment_offset": 0x10,
+        "layout": {
+            "num_files": 0x0C,
+            "name_loc": 0x2C,
+            "name_len": 0x30,
+            "local_header_len": 0x10,
+            "checksum_loc": 0x38,
+            "checksum_len": 0x04,
+            "file_start_in_local": 0x04,
+            "file_size_in_local": 0x08,
+            "mode_in_local": 0x0C,
+        },
     },
-    "IMAGINATORS": {
-        "num_files": 0x0C,
-        "name_loc": 0x28,
-        "name_len": 0x30,
-        "local_header_len": 0x10,
-        "checksum_loc": 0x38,
-        "checksum_len": 0x04,
-        "file_start_in_local": 0x00,
-        "file_size_in_local": 0x08,
-        "mode_in_local": 0x0C,
+    {
+        "name": "IMAGINATORS",
+        "version": 0x0B,
+        "chunk_alignment_offset": 0x10,
+        "layout": {
+            "num_files": 0x0C,
+            "name_loc": 0x28,
+            "name_len": 0x30,
+            "local_header_len": 0x10,
+            "checksum_loc": 0x38,
+            "checksum_len": 0x04,
+            "file_start_in_local": 0x00,
+            "file_size_in_local": 0x08,
+            "mode_in_local": 0x0C,
+        },
     },
-    "CRASH_NST": {
-        "num_files": 0x0C,
-        "name_loc": 0x24,
-        "name_len": 0x2C,
-        "local_header_len": 0x10,
-        "checksum_loc": 0x38,
-        "checksum_len": 0x04,
-        "file_start_in_local": 0x00,
-        "file_size_in_local": 0x08,
-        "mode_in_local": 0x0C,
+    {
+        "name": "CRASH_NST",
+        "version": 0x0C,
+        "chunk_alignment_offset": 0x10,
+        "layout": {
+            "num_files": 0x0C,
+            "name_loc": 0x24,
+            "name_len": 0x2C,
+            "local_header_len": 0x10,
+            "checksum_loc": 0x38,
+            "checksum_len": 0x04,
+            "file_start_in_local": 0x00,
+            "file_size_in_local": 0x08,
+            "mode_in_local": 0x0C,
+        },
     },
-}
+]
 
 
 @dataclass
@@ -150,6 +189,10 @@ class PakEntry:
     size: int
     mode: int
     endianness: str
+    version: int
+    chunk_alignment: int
+    size_field: int
+    size_endianness: str
 
 
 def load_from_path(path: Path, entry: Optional[str] = None) -> HavokPack:
@@ -165,10 +208,6 @@ def load_from_path(path: Path, entry: Optional[str] = None) -> HavokPack:
         data = _extract_from_archive(path, entry)
     else:
         data = path.read_bytes()
-
-    converted = convert_packfile_to_xml(path)
-    if converted:
-        data = converted
 
     return parse_bytes(data, override_name=path.stem)
 
@@ -200,10 +239,6 @@ def _unwrap_bytes(data: bytes) -> bytes:
     igz_payload = _maybe_from_igz(data)
     if igz_payload is not None:
         return igz_payload
-
-    converted = convert_bytes_to_xml(data)
-    if converted is not None:
-        return converted
 
     embedded = _slice_embedded_havok(data)
     if embedded is not None:
@@ -324,7 +359,18 @@ def _read_uint(data: bytes, offset: int, endianness: str) -> int:
     return int.from_bytes(data[offset : offset + 4], order)
 
 
-def _try_layout(data: bytes, layout: Dict[str, int], endianness: str) -> Optional[List[PakEntry]]:
+def _align(value: int, alignment: int) -> int:
+    if alignment <= 0:
+        return value
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _try_layout(data: bytes, profile: Dict[str, object], endianness: str) -> Optional[List[PakEntry]]:
+    layout: Dict[str, int] = profile["layout"]  # type: ignore[assignment]
+    version: int = int(profile["version"])  # type: ignore[index]
+    size_field = 2 if (version & 0xFF) <= 0x0B else 4
+    size_endianness = "big" if (version & 0xFF) <= 0x04 else "little"
+
     num_files = _read_uint(data, layout["num_files"], endianness)
     if num_files <= 0 or num_files > 0xFFFF:
         return None
@@ -333,6 +379,11 @@ def _try_layout(data: bytes, layout: Dict[str, int], endianness: str) -> Optiona
     nametable_len = _read_uint(data, layout["name_len"], endianness)
     if nametable_loc + nametable_len > len(data):
         return None
+
+    alignment_offset = int(profile.get("chunk_alignment_offset", 0x10))
+    chunk_alignment = int(profile.get("chunk_alignment_override") or _read_uint(data, alignment_offset, endianness))
+    if chunk_alignment <= 0:
+        chunk_alignment = 0x8000
 
     names: List[str] = []
     for idx in range(num_files):
@@ -373,7 +424,19 @@ def _try_layout(data: bytes, layout: Dict[str, int], endianness: str) -> Optiona
         # on unusually large inputs.
         if start < 0 or size <= 0 or start > len(data) or size > len(data) - start:
             return None
-        entries.append(PakEntry(name=names[idx], offset=start, size=size, mode=mode, endianness=endianness))
+        entries.append(
+            PakEntry(
+                name=names[idx],
+                offset=start,
+                size=size,
+                mode=mode,
+                endianness=endianness,
+                version=version,
+                chunk_alignment=chunk_alignment,
+                size_field=size_field,
+                size_endianness=size_endianness,
+            )
+        )
 
     return entries
 
@@ -394,8 +457,8 @@ def _read_pak_entries(path: Path) -> List[PakEntry]:
     fallbacks = [preferred, "big" if preferred == "little" else "little"]
 
     for endianness in fallbacks:
-        for layout in _PAK_LAYOUTS.values():
-            entries = _try_layout(data, layout, endianness)
+        for profile in _PAK_PROFILES:
+            entries = _try_layout(data, profile, endianness)
             if entries:
                 return entries
     return []
@@ -408,49 +471,86 @@ def enumerate_pak_entries(path: Path) -> List[PakEntry]:
 
 
 def _decode_pak_entry(data: bytes, entry: PakEntry, entry_map: Dict[str, PakEntry], ordered: List[PakEntry]) -> bytes:
-    # Heuristic: the compressed blob spans until the next entry or EOF.
-    ordered_sorted = sorted(ordered, key=lambda e: e.offset)
-    next_offsets = [e.offset for e in ordered_sorted if e.offset > entry.offset]
-    end = min(next_offsets) if next_offsets else len(data)
-    blob = data[entry.offset:end]
-
     mode_prefix = (entry.mode >> 24) & 0xFF
     if entry.mode == 0xFFFFFFFF or mode_prefix == 0xFF:
-        return blob[: entry.size]
+        return data[entry.offset : entry.offset + entry.size]
 
-    # Try straightforward zlib first; many variants use deflate-chunked blocks.
     if mode_prefix in (0x00, 0x10):
-        try:
-            return zlib.decompress(blob, bufsize=entry.size)
-        except Exception:
-            pass
-        # Fallback: treat the stream as a sequence of length-prefixed chunks.
-        out = bytearray()
-        idx = 0
-        while idx + 2 <= len(blob) and len(out) < entry.size:
-            comp_len = int.from_bytes(blob[idx : idx + 2], entry.endianness)
-            idx += 2
-            if comp_len <= 0 or idx + comp_len > len(blob):
-                break
-            chunk = blob[idx : idx + comp_len]
-            idx += comp_len
-            try:
-                out.extend(zlib.decompress(chunk))
-            except Exception:
-                out.extend(chunk)
-        if out:
-            return bytes(out[: entry.size])
+        decoded = _decode_deflate_chunks(data, entry)
+    elif mode_prefix == 0x20:
+        decoded = _decode_lzma_chunks(data, entry)
+    else:
+        decoded = data[entry.offset : entry.offset + entry.size]
 
-    if mode_prefix == 0x20:
-        # LZMA blocks: assume 5-byte properties followed by compressed size.
-        try:
-            props = blob[:5]
-            lzma_blob = blob[5:]
-            return lzma.LZMADecompressor().decompress(props + lzma_blob)[: entry.size]
-        except Exception:
-            pass
+    return decoded[: entry.size]
 
-    return blob[: entry.size]
+
+def _decode_deflate_chunks(data: bytes, entry: PakEntry) -> bytes:
+    chunk_alignment = entry.chunk_alignment or 0x8000
+    chunk_size = 0x8000
+    cursor = entry.offset
+    out = bytearray()
+
+    while len(out) < entry.size and cursor + entry.size_field <= len(data):
+        comp_size = int.from_bytes(data[cursor : cursor + entry.size_field], entry.size_endianness)
+        cursor += entry.size_field
+        if comp_size <= 0 or cursor + comp_size > len(data):
+            break
+
+        chunk = data[cursor : cursor + comp_size]
+        cursor += comp_size
+
+        try:
+            out.extend(zlib.decompress(chunk))
+        except Exception:
+            raw_len = min(chunk_size, len(chunk), entry.size - len(out))
+            out.extend(chunk[:raw_len])
+
+        cursor = _align(cursor, chunk_alignment)
+
+    if not out:
+        return data[entry.offset : entry.offset + entry.size]
+
+    return bytes(out)
+
+
+def _decode_lzma_chunks(data: bytes, entry: PakEntry) -> bytes:
+    chunk_alignment = entry.chunk_alignment or 0x8000
+    chunk_size = 0x8000
+    cursor = entry.offset
+    out = bytearray()
+
+    while len(out) < entry.size and cursor + entry.size_field + 5 <= len(data):
+        comp_size = int.from_bytes(data[cursor : cursor + entry.size_field], entry.size_endianness)
+        cursor += entry.size_field
+        if cursor + 5 > len(data):
+            break
+
+        props = data[cursor : cursor + 5]
+        cursor += 5
+
+        if comp_size <= 0 or cursor + comp_size > len(data):
+            break
+
+        comp_bytes = data[cursor : cursor + comp_size]
+        cursor += comp_size
+
+        try:
+            out_chunk = lzma.LZMADecompressor().decompress(props + comp_bytes)
+            if not out_chunk:
+                out_chunk = comp_bytes[:chunk_size]
+        except Exception:
+            out_chunk = comp_bytes[:chunk_size]
+
+        remaining = entry.size - len(out)
+        out.extend(out_chunk[:remaining])
+
+        cursor = _align(cursor, chunk_alignment)
+
+    if not out:
+        return data[entry.offset : entry.offset + entry.size]
+
+    return bytes(out)
 
 
 def _parse_skeleton(root: ET.Element, override_name: Optional[str]) -> Optional[HavokSkeleton]:
