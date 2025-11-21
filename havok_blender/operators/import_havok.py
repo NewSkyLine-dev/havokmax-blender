@@ -9,13 +9,24 @@ from bpy_extras.io_utils import ImportHelper, axis_conversion
 from mathutils import Vector
 
 from ..io import parsers
-from ..io.parsers import HavokPack, load_from_path, SUPPORTED_EXTENSIONS
+from ..io.parsers import (
+    HavokPack,
+    load_from_path,
+    SUPPORTED_EXTENSIONS,
+    PAK_PROFILE_NAMES,
+    PAK_PLATFORM_ENDIANNESS,
+)
 
 
 class HavokPakEntry(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
     size: bpy.props.IntProperty()
     mode: bpy.props.StringProperty()
+
+
+def _refresh_pak_entries(self, _context):  # pragma: no cover - UI callback
+    if self.filepath.lower().endswith(".pak"):
+        self._load_pak_entries()
 
 
 class HAVOK_UL_pak_entries(bpy.types.UIList):
@@ -47,6 +58,27 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     pak_entries: bpy.props.CollectionProperty(type=HavokPakEntry)
     pak_active_index: bpy.props.IntProperty()
     last_pak_path: bpy.props.StringProperty(options={"HIDDEN"})
+
+    pak_profile: bpy.props.EnumProperty(
+        name="Game version",
+        description="Choose the exact PAK layout for the game you are importing",
+        items=[
+            (name, name.replace("_", " "), f"Use the {name} PAK layout")
+            for name in PAK_PROFILE_NAMES
+        ],
+        default=PAK_PROFILE_NAMES[0] if PAK_PROFILE_NAMES else "",
+        update=_refresh_pak_entries,
+    )
+    pak_platform: bpy.props.EnumProperty(
+        name="Platform",
+        description="Pick the platform endianness that matches the dump you are importing",
+        items=[
+            (key, label, label)
+            for key, label in PAK_PLATFORM_ENDIANNESS.items()
+        ],
+        default="little",
+        update=_refresh_pak_entries,
+    )
 
     archive_entry: bpy.props.StringProperty(
         name="Archive entry",
@@ -86,8 +118,16 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             if 0 <= self.pak_active_index < len(self.pak_entries):
                 self.archive_entry = self.pak_entries[self.pak_active_index].name
 
+        pak_profile = self.pak_profile if filepath.suffix.lower() == ".pak" else None
+        pak_platform = self.pak_platform if filepath.suffix.lower() == ".pak" else None
+
         try:
-            pack = load_from_path(filepath, entry=self.archive_entry or None)
+            pack = load_from_path(
+                filepath,
+                entry=self.archive_entry or None,
+                pak_profile=pak_profile,
+                pak_platform=pak_platform,
+            )
         except Exception as exc:  # pragma: no cover - Blender reports the error
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -112,6 +152,8 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         layout.prop(self, "import_animation")
         layout.prop(self, "archive_entry")
         if self.filepath.lower().endswith(".pak"):
+            layout.prop(self, "pak_profile")
+            layout.prop(self, "pak_platform")
             row = layout.row()
             row.template_list(
                 "HAVOK_UL_pak_entries",
@@ -165,7 +207,9 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         if not self.filepath:
             return
         try:
-            entries = parsers.enumerate_pak_entries(Path(self.filepath))
+            entries = parsers.enumerate_pak_entries(
+                Path(self.filepath), self.pak_profile, self.pak_platform
+            )
         except Exception:
             return
 
@@ -176,6 +220,9 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             item.mode = hex(entry.mode)
         if entries:
             self.archive_entry = entries[0].name
+            self.pak_active_index = 0
+        else:
+            self.archive_entry = ""
             self.pak_active_index = 0
 
     def _build_animations(

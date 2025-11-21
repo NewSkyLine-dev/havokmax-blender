@@ -21,6 +21,13 @@ import mathutils
 
 SUPPORTED_EXTENSIONS = {".hkx", ".hka", ".hkt", ".igz", ".pak"}
 
+# Platform-aware PAK parsing: users pick the game version (layout profile)
+# and target platform endianness instead of the importer guessing.
+PAK_PLATFORM_ENDIANNESS = {
+    "little": "Little endian (PC / Xbox 360 / Xbox One / Wii U)",
+    "big": "Big endian (PS3 / Wii)",
+}
+
 _PAK_PROFILES = [
     {
         "name": "SSA_WII",
@@ -152,6 +159,8 @@ _PAK_PROFILES = [
         },
     },
 ]
+
+PAK_PROFILE_NAMES = tuple(profile["name"] for profile in _PAK_PROFILES)
 
 
 @dataclass
@@ -311,7 +320,12 @@ class _IgzExtractor:
             self.blocks.append(self.data[pointer_offset : pointer_offset + size])
 
 
-def load_from_path(path: Path, entry: Optional[str] = None) -> HavokPack:
+def load_from_path(
+    path: Path,
+    entry: Optional[str] = None,
+    pak_profile: Optional[str] = None,
+    pak_platform: Optional[str] = None,
+) -> HavokPack:
     """Load any supported Havok source from disk.
 
     Args:
@@ -321,7 +335,7 @@ def load_from_path(path: Path, entry: Optional[str] = None) -> HavokPack:
 
     suffix = path.suffix.lower()
     if suffix == ".pak":
-        data = _extract_from_archive(path, entry)
+        data = _extract_from_archive(path, entry, pak_profile, pak_platform)
     else:
         data = path.read_bytes()
 
@@ -365,7 +379,9 @@ def _unwrap_bytes(data: bytes) -> bytes:
     return data
 
 
-def _extract_from_archive(path: Path, entry: Optional[str]) -> bytes:
+def _extract_from_archive(
+    path: Path, entry: Optional[str], pak_profile: Optional[str], pak_platform: Optional[str]
+) -> bytes:
     # Try ZIP style first (many PAK files are simple zips).
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path, "r") as zf:
@@ -384,15 +400,18 @@ def _extract_from_archive(path: Path, entry: Optional[str]) -> bytes:
     except tarfile.TarError:
         pass
 
-    pak_entries = _read_pak_entries(path)
-    if pak_entries:
-        entry_map = {p.name: p for p in pak_entries}
-        target_name = entry or (next((name for name in entry_map if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS), None))
-        if target_name is None:
-            target_name = pak_entries[0].name
-        if target_name not in entry_map:
-            raise ValueError(f"Entry '{target_name}' not found in PAK; options: {sorted(entry_map.keys())}")
-        return _decode_pak_entry(path.read_bytes(), entry_map[target_name], entry_map, pak_entries)
+    if pak_profile is not None and pak_platform is not None:
+        pak_entries = _read_pak_entries(path, pak_profile, pak_platform)
+        if pak_entries:
+            entry_map = {p.name: p for p in pak_entries}
+            target_name = entry or (next((name for name in entry_map if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS), None))
+            if target_name is None:
+                target_name = pak_entries[0].name
+            if target_name not in entry_map:
+                raise ValueError(f"Entry '{target_name}' not found in PAK; options: {sorted(entry_map.keys())}")
+            return _decode_pak_entry(path.read_bytes(), entry_map[target_name], entry_map, pak_entries)
+    elif pak_profile is not None or pak_platform is not None:
+        raise ValueError("Both PAK game version and platform must be selected for .pak imports")
 
     # As a fallback, treat the PAK as a raw blob and attempt to pull embedded
     # Havok XML from it. This mirrors the lightweight extraction implemented in
@@ -562,7 +581,7 @@ def _try_layout(data: bytes, profile: Dict[str, object], endianness: str) -> Opt
     return entries
 
 
-def _read_pak_entries(path: Path) -> List[PakEntry]:
+def _read_pak_entries(path: Path, profile_name: str, endianness: str) -> List[PakEntry]:
     data = path.read_bytes()
     if len(data) < 0x40:
         return []
@@ -571,24 +590,21 @@ def _read_pak_entries(path: Path) -> List[PakEntry]:
     if magic not in (b"\x1AAGI", b"IGA\x1A"):
         return []
 
-    # Some dumps flip the endianness flag without altering the header
-    # ordering. To avoid dropping valid archives, try both byte orders even
-    # if the signature suggests one.
-    preferred = "little" if magic == b"\x1AAGI" else "big"
-    fallbacks = [preferred, "big" if preferred == "little" else "little"]
+    profile = next((p for p in _PAK_PROFILES if p["name"] == profile_name), None)
+    if profile is None:
+        raise ValueError(f"Unknown PAK profile '{profile_name}'")
 
-    for endianness in fallbacks:
-        for profile in _PAK_PROFILES:
-            entries = _try_layout(data, profile, endianness)
-            if entries:
-                return entries
-    return []
+    if endianness not in ("little", "big"):
+        raise ValueError("PAK platform endianness must be 'little' or 'big'")
+
+    entries = _try_layout(data, profile, endianness)
+    return entries or []
 
 
-def enumerate_pak_entries(path: Path) -> List[PakEntry]:
-    """Return parsed PAK entries for UI listing."""
+def enumerate_pak_entries(path: Path, profile_name: str, endianness: str) -> List[PakEntry]:
+    """Return parsed PAK entries for UI listing using user-selected layout/platform."""
 
-    return _read_pak_entries(path)
+    return _read_pak_entries(path, profile_name, endianness)
 
 
 def _decode_pak_entry(data: bytes, entry: PakEntry, entry_map: Dict[str, PakEntry], ordered: List[PakEntry]) -> bytes:
