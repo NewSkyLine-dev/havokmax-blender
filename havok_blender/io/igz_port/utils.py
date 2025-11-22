@@ -22,9 +22,10 @@ class NoeBitStream:
         self.offset = 0
 
     def _require(self, size: int) -> None:
-        if self.offset + size > len(self.data):
+        remaining = len(self.data) - self.offset
+        if self.offset < 0 or remaining < size:
             raise ValueError(
-                f"Unexpected end of IGZ stream at {self.offset} (wanted {size} bytes, have {len(self.data) - self.offset})"
+                f"Unexpected end of IGZ stream at {self.offset} (wanted {size} bytes, have {max(remaining, 0)})"
             )
 
     def seek(self, offset: int, whence: int = constants.SeekMode.ABS) -> int:
