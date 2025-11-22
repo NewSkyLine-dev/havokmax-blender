@@ -198,7 +198,8 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
         if filepath.suffix.lower() == ".pak" and self.pak_entries:
             if 0 <= self.pak_active_index < len(self.pak_entries):
-                self.archive_entry = self.pak_entries[self.pak_active_index].name
+                active_item = self.pak_entries[self.pak_active_index]
+                self.archive_entry = active_item.path or active_item.name
 
         pak_profile = self.pak_profile if filepath.suffix.lower() == ".pak" else None
         pak_platform = self.pak_platform if filepath.suffix.lower() == ".pak" else None

@@ -408,7 +408,15 @@ def _extract_from_archive(
         pak_entries = _read_pak_entries(path, pak_profile, pak_platform)
         if pak_entries:
             entry_map = {p.name: p for p in pak_entries}
-            target_name = entry or (next((name for name in entry_map if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS), None))
+            for pak_entry in pak_entries:
+                base = Path(pak_entry.name).name
+                entry_map.setdefault(base, pak_entry)
+                if "," in base:
+                    entry_map.setdefault(base.split(",", 1)[0], pak_entry)
+
+            target_name = entry or (
+                next((name for name in entry_map if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS), None)
+            )
             if target_name is None:
                 target_name = pak_entries[0].name
             if target_name not in entry_map:
