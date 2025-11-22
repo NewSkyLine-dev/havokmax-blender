@@ -12,6 +12,7 @@ from ..io import parsers
 from ..io.parsers import (
     HavokPack,
     load_from_path,
+    load_igz_bytes,
     SUPPORTED_EXTENSIONS,
     PAK_PROFILE_NAMES,
     PAK_PLATFORM_ENDIANNESS,
@@ -204,6 +205,23 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         pak_profile = self.pak_profile if filepath.suffix.lower() == ".pak" else None
         pak_platform = self.pak_platform if filepath.suffix.lower() == ".pak" else None
 
+        target_ext = Path(self.archive_entry or filepath.name).suffix.lower()
+        if target_ext == ".igz":
+            try:
+                igz_bytes = load_igz_bytes(
+                    filepath,
+                    entry=self.archive_entry or None,
+                    pak_profile=pak_profile,
+                    pak_platform=pak_platform,
+                )
+                self._import_igz_blob(igz_bytes)
+            except Exception as exc:  # pragma: no cover - Blender reports the error
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+
+            self.report({"INFO"}, f"Imported {filepath.name}")
+            return {"FINISHED"}
+
         try:
             pack = load_from_path(
                 filepath,
@@ -375,6 +393,15 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
             # Keep last action applied
             armature_obj.animation_data.action = action
+
+    def _import_igz_blob(self, data: bytes):
+        # Mirror the io_scene_igz import path by letting its parser build Blender
+        # objects directly from the binary IGZ stream.
+        from ..io.igz_port.igz_file import igzFile
+
+        igz = igzFile(data)
+        igz.loadFile()
+        igz.buildMeshes()
 
     def _build_meshes(
         self,

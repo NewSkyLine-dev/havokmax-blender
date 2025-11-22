@@ -350,6 +350,25 @@ def load_from_path(
     return parse_bytes(data, override_name=path.stem)
 
 
+def load_igz_bytes(
+    path: Path,
+    entry: Optional[str] = None,
+    pak_profile: Optional[str] = None,
+    pak_platform: Optional[str] = None,
+) -> bytes:
+    """Load raw IGZ payload bytes from disk or a PAK entry.
+
+    This mirrors :func:`load_from_path` but skips Havok XML parsing so the
+    io_scene_igz-style importer can consume the binary stream directly.
+    """
+
+    suffix = path.suffix.lower()
+    if suffix == ".pak":
+        return _extract_from_archive(path, entry, pak_profile, pak_platform)
+
+    return path.read_bytes()
+
+
 def parse_bytes(data: bytes, override_name: Optional[str] = None) -> HavokPack:
     """Parse Havok XML/IGZ data into skeleton and animation structures."""
 
