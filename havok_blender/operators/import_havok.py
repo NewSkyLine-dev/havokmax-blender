@@ -25,8 +25,16 @@ class HavokPakEntry(bpy.types.PropertyGroup):
 
 
 def _refresh_pak_entries(self, _context):  # pragma: no cover - UI callback
-    if self.filepath.lower().endswith(".pak"):
-        self._load_pak_entries()
+    if not self.filepath.lower().endswith(".pak"):
+        return
+
+    # Some Blender versions construct RNA proxy objects that may not expose
+    # Python-only helpers until the operator is fully instantiated. Be
+    # defensive so the UI callback never raises while the operator is being
+    # created or refreshed.
+    loader = getattr(self, "_load_pak_entries", None)
+    if callable(loader):
+        loader()
 
 
 class HAVOK_UL_pak_entries(bpy.types.UIList):
