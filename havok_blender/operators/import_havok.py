@@ -6,7 +6,7 @@ from typing import Optional
 
 import bpy
 from bpy_extras.io_utils import ImportHelper, axis_conversion
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 from ..io import parsers
 from ..io.parsers import (
@@ -95,6 +95,12 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         description="Generate Blender actions for each Havok animation track",
     )
 
+    import_meshes: bpy.props.BoolProperty(
+        name="Import static meshes",
+        default=True,
+        description="Build Blender meshes from Havok geometry when available",
+    )
+
     import_skeleton: bpy.props.BoolProperty(
         name="Import skeleton",
         default=True,
@@ -133,21 +139,23 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             return {"CANCELLED"}
 
         prefs = context.preferences.addons[__package__.split(".")[0]].preferences
+        axis_mat: Matrix = axis_conversion(
+            from_forward="-Y", from_up="Z", to_forward=prefs.forward_axis, to_up=prefs.up_axis
+        ).to_4x4()
         armature_obj: Optional[bpy.types.Object] = None
         if self.import_skeleton and pack.skeleton:
-            armature_obj = self._build_armature(
-                context, pack, prefs.scale, prefs.forward_axis, prefs.up_axis
-            )
+            armature_obj = self._build_armature(context, pack, prefs.scale, axis_mat)
+        if self.import_meshes and pack.meshes:
+            self._build_meshes(context, pack, prefs.scale, axis_mat, armature_obj)
         if self.import_animation and pack.animations:
-            self._build_animations(
-                context, pack, armature_obj, prefs.scale, prefs.forward_axis, prefs.up_axis
-            )
+            self._build_animations(context, pack, armature_obj, prefs.scale, axis_mat)
 
         self.report({"INFO"}, f"Imported {filepath.name}")
         return {"FINISHED"}
 
     def draw(self, context):
         layout = self.layout
+        layout.prop(self, "import_meshes")
         layout.prop(self, "import_skeleton")
         layout.prop(self, "import_animation")
         layout.prop(self, "archive_entry")
@@ -173,8 +181,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         context: bpy.types.Context,
         pack: HavokPack,
         scale: float,
-        forward: str,
-        up: str,
+        axis_mat: Matrix,
     ) -> bpy.types.Object:
         assert pack.skeleton
         skel = pack.skeleton
@@ -185,7 +192,6 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         collection.objects.link(armature_obj)
         bpy.context.view_layer.objects.active = armature_obj
 
-        axis_mat = axis_conversion(from_forward="-Y", from_up="Z", to_forward=forward, to_up=up).to_4x4()
         armature_obj.matrix_world = axis_mat @ armature_obj.matrix_world
 
         bpy.ops.object.mode_set(mode="EDIT")
@@ -234,12 +240,11 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         pack: HavokPack,
         armature_obj: Optional[bpy.types.Object],
         scale: float,
-        forward: str,
-        up: str,
+        axis_mat: Matrix,
     ) -> None:
         if armature_obj is None:
             armature_obj = (
-                self._build_armature(context, pack, scale, forward, up) if pack.skeleton else None
+                self._build_armature(context, pack, scale, axis_mat) if pack.skeleton else None
             )
         if armature_obj is None:
             return
@@ -276,6 +281,28 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
             # Keep last action applied
             armature_obj.animation_data.action = action
+
+    def _build_meshes(
+        self,
+        context: bpy.types.Context,
+        pack: HavokPack,
+        scale: float,
+        axis_mat: Matrix,
+        armature_obj: Optional[bpy.types.Object],
+    ) -> None:
+        collection = _get_or_create_collection(context, "Havok Imports")
+        for mesh_data in pack.meshes:
+            mesh = bpy.data.meshes.new(mesh_data.name)
+            transformed_verts = [
+                (axis_mat @ (v * scale).to_4d()).to_3d() for v in mesh_data.vertices
+            ]
+            mesh.from_pydata(transformed_verts, [], mesh_data.faces)
+            mesh.update()
+
+            obj = bpy.data.objects.new(mesh_data.name, mesh)
+            collection.objects.link(obj)
+            if armature_obj:
+                obj.parent = armature_obj
 
 
 def _get_or_create_collection(context: bpy.types.Context, name: str):

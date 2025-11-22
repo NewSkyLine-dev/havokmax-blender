@@ -189,6 +189,14 @@ class HavokAnimation:
 class HavokPack:
     skeleton: Optional[HavokSkeleton]
     animations: List[HavokAnimation]
+    meshes: List["HavokMesh"]
+
+
+@dataclass
+class HavokMesh:
+    name: str
+    vertices: List[mathutils.Vector]
+    faces: List[Tuple[int, int, int]]
 
 
 @dataclass
@@ -353,7 +361,8 @@ def parse_bytes(data: bytes, override_name: Optional[str] = None) -> HavokPack:
 
     skeleton = _parse_skeleton(root, override_name)
     animations = _parse_animations(root, skeleton)
-    return HavokPack(skeleton=skeleton, animations=animations)
+    meshes = _parse_meshes(root, override_name)
+    return HavokPack(skeleton=skeleton, animations=animations, meshes=meshes)
 
 
 def _unwrap_bytes(data: bytes) -> bytes:
@@ -716,6 +725,52 @@ def _parse_skeleton(root: ET.Element, override_name: Optional[str]) -> Optional[
             )
 
     return HavokSkeleton(name=skel_name, bones=bones)
+
+
+def _parse_meshes(root: ET.Element, override_name: Optional[str]) -> List[HavokMesh]:
+    meshes: List[HavokMesh] = []
+
+    def _first_param(obj: ET.Element, names: Iterable[str]) -> Optional[ET.Element]:
+        for n in names:
+            param = obj.find(f"hkparam[@name='{n}']")
+            if param is not None and param.text:
+                return param
+        return None
+
+    for idx, obj in enumerate(root.findall(".//hkobject")):
+        verts_param = _first_param(obj, ("vertices", "positions"))
+        tris_param = _first_param(obj, ("triangles", "indices", "indices16", "indices32"))
+        if verts_param is None or tris_param is None:
+            continue
+
+        vert_values = [float(v) for v in verts_param.text.split() if v.strip()]
+        tri_values = [int(v) for v in tris_param.text.split() if v.strip()]
+        if len(vert_values) < 3 or len(tri_values) < 3:
+            continue
+
+        vertices = [mathutils.Vector(vert_values[i : i + 3]) for i in range(0, len(vert_values) - 2, 3)]
+
+        if len(tri_values) % 3 == 0:
+            stride = 3
+        elif len(tri_values) % 4 == 0:
+            stride = 4
+        else:
+            continue
+
+        faces: List[Tuple[int, int, int]] = []
+        for i in range(0, len(tri_values) - stride + 1, stride):
+            face = tri_values[i : i + 3]
+            if min(face) < 0 or max(face) >= len(vertices):
+                continue
+            faces.append(tuple(face))
+
+        if not faces or not vertices:
+            continue
+
+        name = obj.attrib.get("name") or override_name or f"Mesh_{idx}"
+        meshes.append(HavokMesh(name=name, vertices=vertices, faces=faces))
+
+    return meshes
 
 
 def _parse_animations(root: ET.Element, skeleton: Optional[HavokSkeleton]) -> List[HavokAnimation]:
