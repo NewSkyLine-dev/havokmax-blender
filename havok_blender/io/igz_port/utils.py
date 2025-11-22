@@ -21,6 +21,12 @@ class NoeBitStream:
         self.endian = endian
         self.offset = 0
 
+    def _require(self, size: int) -> None:
+        if self.offset + size > len(self.data):
+            raise ValueError(
+                f"Unexpected end of IGZ stream at {self.offset} (wanted {size} bytes, have {len(self.data) - self.offset})"
+            )
+
     def seek(self, offset: int, whence: int = constants.SeekMode.ABS) -> int:
         if whence == constants.SeekMode.ABS:
             self.offset = offset
@@ -32,6 +38,7 @@ class NoeBitStream:
         return self.offset
 
     def readBytes(self, size: int) -> bytes:
+        self._require(size)
         bytes_data = self.data[self.offset:self.offset + size]
         self.offset += size
         return bytes_data
@@ -39,6 +46,7 @@ class NoeBitStream:
     def readUInt(self) -> int:
         endian = self.endian.value if hasattr(
             self.endian, 'value') else self.endian
+        self._require(4)
         val = struct.unpack(
             f"{endian}I", self.data[self.offset:self.offset + 4])[0]
         self.offset += 4
@@ -47,6 +55,7 @@ class NoeBitStream:
     def readUInt64(self) -> int:
         endian = self.endian.value if hasattr(
             self.endian, 'value') else self.endian
+        self._require(8)
         val = struct.unpack(
             f"{endian}Q", self.data[self.offset:self.offset + 8])[0]
         self.offset += 8
@@ -55,6 +64,7 @@ class NoeBitStream:
     def readInt(self) -> int:
         endian = self.endian.value if hasattr(
             self.endian, 'value') else self.endian
+        self._require(4)
         val = struct.unpack(
             f"{endian}i", self.data[self.offset:self.offset + 4])[0]
         self.offset += 4
@@ -63,12 +73,14 @@ class NoeBitStream:
     def readUShort(self) -> int:
         endian = self.endian.value if hasattr(
             self.endian, 'value') else self.endian
+        self._require(2)
         val = struct.unpack(
             endian + 'H', self.data[self.offset:self.offset + 2])[0]
         self.offset += 2
         return val
 
     def readUByte(self) -> int:
+        self._require(1)
         val = self.data[self.offset]
         self.offset += 1
         return val
@@ -86,6 +98,7 @@ class NoeBitStream:
     def readFloat(self) -> float:
         endian = self.endian.value if hasattr(
             self.endian, 'value') else self.endian
+        self._require(4)
         val = struct.unpack(
             endian + 'f', self.data[self.offset:self.offset + 4])[0]
         self.offset += 4
@@ -94,6 +107,7 @@ class NoeBitStream:
     def readDouble(self) -> float:
         endian = self.endian.value if hasattr(
             self.endian, 'value') else self.endian
+        self._require(8)
         val = struct.unpack(
             endian + 'd', self.data[self.offset:self.offset + 8])[0]
         self.offset += 8
@@ -102,6 +116,7 @@ class NoeBitStream:
     def readShort(self) -> int:
         endian = self.endian.value if hasattr(
             self.endian, 'value') else self.endian
+        self._require(2)
         val = struct.unpack(
             endian + 'h', self.data[self.offset:self.offset + 2])[0]
         self.offset += 2
@@ -109,6 +124,7 @@ class NoeBitStream:
 
     def readHalfFloat(self) -> float:
         """Convert half precision (16-bit) float to regular float"""
+        self._require(2)
         half = struct.unpack(
             self.endian + 'H', self.data[self.offset:self.offset + 2])[0]
         self.offset += 2
