@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import bpy
 from bpy_extras.io_utils import ImportHelper, axis_conversion
@@ -20,8 +20,11 @@ from ..io.parsers import (
 
 class HavokPakEntry(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
+    path: bpy.props.StringProperty()
     size: bpy.props.IntProperty()
     mode: bpy.props.StringProperty()
+    is_dir: bpy.props.BoolProperty()
+    depth: bpy.props.IntProperty()
 
 
 def _refresh_pak_entries(self, _context):  # pragma: no cover - UI callback
@@ -37,14 +40,70 @@ def _refresh_pak_entries(self, _context):  # pragma: no cover - UI callback
         loader()
 
 
+def _on_active_pak_changed(self, _context):  # pragma: no cover - UI callback
+    if not getattr(self, "pak_entries", None):
+        return
+    if self.pak_active_index < 0 or self.pak_active_index >= len(self.pak_entries):
+        return
+    item = self.pak_entries[self.pak_active_index]
+    if not item.is_dir:
+        self.archive_entry = item.path or item.name
+
+
+def _build_pak_tree(entries: List[parsers.PakEntry]) -> List[Dict[str, object]]:
+    """Flattened directory tree for UI presentation."""
+
+    root: Dict[str, object] = {"children": {}, "depth": -1}
+
+    for entry in entries:
+        parts = [p for p in entry.name.replace("\\", "/").split("/") if p]
+        if not parts:
+            parts = [entry.name]
+
+        node = root
+        for depth, part in enumerate(parts):
+            children: Dict[str, Dict[str, object]] = node.setdefault("children", {})  # type: ignore[assignment]
+            if part not in children:
+                children[part] = {
+                    "name": part,
+                    "path": "/".join(parts[: depth + 1]),
+                    "children": {},
+                    "depth": depth,
+                    "is_dir": True,
+                }
+            node = children[part]
+
+        node.update({
+            "is_dir": False,
+            "size": entry.size,
+            "mode": hex(entry.mode),
+        })
+
+    ordered: List[Dict[str, object]] = []
+
+    def walk(current: Dict[str, object]) -> None:
+        for key in sorted(current.get("children", {}).keys()):
+            child: Dict[str, object] = current["children"][key]  # type: ignore[index]
+            ordered.append(child)
+            walk(child)
+
+    walk(root)
+    return ordered
+
+
 class HAVOK_UL_pak_entries(bpy.types.UIList):
     bl_idname = "HAVOK_UL_pak_entries"
 
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname):  # pragma: no cover - UI
         if self.layout_type in {"DEFAULT", "COMPACT"}:
-            layout.label(text=item.name, icon="FILE_ARCHIVE")
-            layout.label(text=f"{item.size} bytes")
-            layout.label(text=item.mode)
+            row = layout.row()
+            indent_row = row.row()
+            for _ in range(max(item.depth, 0)):
+                indent_row.separator_spacer()
+            indent_row.label(text=item.name, icon="FILE_FOLDER" if item.is_dir else "FILE_ARCHIVE")
+            if not item.is_dir:
+                row.label(text=f"{item.size} bytes")
+                row.label(text=item.mode)
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text=item.name)
@@ -64,8 +123,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     )
 
     pak_entries: bpy.props.CollectionProperty(type=HavokPakEntry)
-    pak_active_index: bpy.props.IntProperty()
+    pak_active_index: bpy.props.IntProperty(update=_on_active_pak_changed)
     last_pak_path: bpy.props.StringProperty(options={"HIDDEN"})
+    last_pak_profile: bpy.props.StringProperty(options={"HIDDEN"})
+    last_pak_platform: bpy.props.StringProperty(options={"HIDDEN"})
 
     pak_profile: bpy.props.EnumProperty(
         name="Game version",
@@ -116,10 +177,17 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     )
 
     def check(self, _context):  # pragma: no cover - UI callback
-        if self.filepath.lower().endswith(".pak") and self.filepath != self.last_pak_path:
-            self._load_pak_entries()
-            self.last_pak_path = self.filepath
-            return True
+        if self.filepath.lower().endswith(".pak"):
+            if (
+                self.filepath != self.last_pak_path
+                or self.pak_profile != self.last_pak_profile
+                or self.pak_platform != self.last_pak_platform
+            ):
+                self._load_pak_entries()
+                self.last_pak_path = self.filepath
+                self.last_pak_profile = self.pak_profile
+                self.last_pak_platform = self.pak_platform
+                return True
         return False
 
     def execute(self, context: bpy.types.Context):
@@ -220,6 +288,8 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         return armature_obj
 
     def _load_pak_entries(self) -> None:
+        previous_path = self.archive_entry
+
         self.pak_entries.clear()
         if not self.filepath:
             return
@@ -230,17 +300,32 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         except Exception:
             return
 
-        for entry in entries:
+        tree = _build_pak_tree(entries)
+        for node in tree:
             item = self.pak_entries.add()
-            item.name = entry.name
-            item.size = entry.size
-            item.mode = hex(entry.mode)
-        if entries:
-            self.archive_entry = entries[0].name
-            self.pak_active_index = 0
+            item.name = node["name"]
+            item.path = node["path"]
+            item.size = node.get("size", 0)
+            item.mode = node.get("mode", "")
+            item.is_dir = node.get("is_dir", False)
+            item.depth = node.get("depth", 0)
+
+        preferred = next((n for n in tree if n.get("path") == previous_path and not n["is_dir"]), None)
+        if preferred:
+            self.archive_entry = preferred["path"]
+            self.pak_active_index = tree.index(preferred)
         else:
-            self.archive_entry = ""
-            self.pak_active_index = 0
+            first_leaf = next((n for n in tree if not n["is_dir"]), None)
+            if first_leaf:
+                self.archive_entry = first_leaf["path"]
+                self.pak_active_index = tree.index(first_leaf)
+            else:
+                self.archive_entry = ""
+                self.pak_active_index = 0
+
+        self.last_pak_path = self.filepath
+        self.last_pak_profile = self.pak_profile
+        self.last_pak_platform = self.pak_platform
 
     def _build_animations(
         self,

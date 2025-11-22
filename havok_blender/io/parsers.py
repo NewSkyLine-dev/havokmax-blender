@@ -568,10 +568,10 @@ def _try_layout(data: bytes, profile: Dict[str, object], endianness: str) -> Opt
         start = _read_uint(data, header_base + file_start_in_local, endianness)
         size = _read_uint(data, header_base + file_size_in_local, endianness)
         mode = _read_uint(data, header_base + mode_in_local, endianness)
-        # Guard against bogus offsets or overflowed spans. Using a difference
-        # check avoids the possibility of start + size wrapping past len(data)
-        # on unusually large inputs.
-        if start < 0 or size <= 0 or start > len(data) or size > len(data) - start:
+        # Keep validation permissive: some archives report the uncompressed
+        # payload size, which can legitimately exceed the remaining buffer
+        # when chunks are compressed. Only reject obviously corrupt headers.
+        if start < 0 or size <= 0 or start >= len(data):
             return None
         entries.append(
             PakEntry(
