@@ -51,6 +51,9 @@ def _on_active_pak_changed(self, _context):  # pragma: no cover - UI callback
     item = self.pak_entries[self.pak_active_index]
     if not item.is_dir:
         self.archive_entry = item.path or item.name
+        refresher = getattr(self, "_refresh_animation_metadata", None)
+        if callable(refresher):
+            refresher()
 
 
 def _build_pak_tree(entries: List[parsers.PakEntry]) -> List[Dict[str, object]]:
@@ -136,6 +139,9 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     last_pak_path: bpy.props.StringProperty(options={"HIDDEN"})
     last_pak_profile: bpy.props.StringProperty(options={"HIDDEN"})
     last_pak_platform: bpy.props.StringProperty(options={"HIDDEN"})
+    animation_count: bpy.props.IntProperty(options={"HIDDEN"}, default=0)
+    animation_names: bpy.props.StringProperty(options={"HIDDEN"}, default="")
+    animation_metadata_key: bpy.props.StringProperty(options={"HIDDEN"}, default="")
 
     pak_profile: bpy.props.EnumProperty(
         name="Game version",
@@ -162,6 +168,16 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             "first Havok payload."
         ),
         default="",
+    )
+
+    animation_index: bpy.props.IntProperty(
+        name="Animation index",
+        description=(
+            "Choose which animation to import when the source contains multiple motions. "
+            "Use -1 to import every animation."
+        ),
+        default=-1,
+        min=-1,
     )
 
     igz_build_meshes: bpy.props.BoolProperty(
@@ -223,8 +239,12 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 self.last_pak_path = self.filepath
                 self.last_pak_profile = self.pak_profile
                 self.last_pak_platform = self.pak_platform
+                self._refresh_animation_metadata()
                 return True
-        return False
+
+        previous_key = self.animation_metadata_key
+        self._refresh_animation_metadata()
+        return previous_key != self.animation_metadata_key
 
     def execute(self, context: bpy.types.Context):
         filepath = Path(self.filepath)
@@ -284,8 +304,16 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             armature_obj = self._build_armature(context, pack, prefs.scale, axis_mat)
         if self.import_meshes and pack.meshes:
             self._build_meshes(context, pack, prefs.scale, axis_mat, armature_obj)
-        if self._should_import_animation(target_ext, pack, armature_obj):
-            self._build_animations(context, pack, armature_obj, prefs.scale, axis_mat)
+        selected_animations = self._resolve_animations(pack)
+        if self._should_import_animation(target_ext, selected_animations, armature_obj):
+            self._build_animations(
+                context,
+                pack,
+                selected_animations,
+                armature_obj,
+                prefs.scale,
+                axis_mat,
+            )
 
         self.report({"INFO"}, f"Imported {filepath.name}")
         return {"FINISHED"}
@@ -295,7 +323,25 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         layout.prop(self, "import_meshes")
         layout.prop(self, "import_skeleton")
         target_ext = Path(self.archive_entry or self.filepath).suffix.lower()
+        self._refresh_animation_metadata()
         layout.prop(self, "archive_entry")
+        if target_ext in {".hka", ".hkx"}:
+            layout.separator()
+            layout.label(text="Animation options:")
+            layout.prop(self, "animation_index")
+            if self.animation_count:
+                layout.label(
+                    text=(
+                        f"Available animations: {self.animation_count}"
+                        + (" (names)" if self.animation_names.strip() else "")
+                    )
+                )
+                if self.animation_names.strip():
+                    preview = self.animation_names.splitlines()[:5]
+                    for idx, name in enumerate(preview):
+                        layout.label(text=f"{idx}: {name}")
+                    if len(self.animation_names.splitlines()) > len(preview):
+                        layout.label(text="…")
         if target_ext == ".igz":
             layout.use_property_split = True
             layout.separator()
@@ -403,10 +449,13 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         self.last_pak_profile = self.pak_profile
         self.last_pak_platform = self.pak_platform
 
+        self._refresh_animation_metadata()
+
     def _build_animations(
         self,
         context: bpy.types.Context,
         pack: HavokPack,
+        animations: List[parsers.HavokAnimation],
         armature_obj: Optional[bpy.types.Object],
         scale: float,
         axis_mat: Matrix,
@@ -420,7 +469,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         if armature_obj is None:
             return
 
-        for animation in pack.animations:
+        for animation in animations:
             action = bpy.data.actions.new(animation.name)
             armature_obj.animation_data_create()
             armature_obj.animation_data.action = action
@@ -485,14 +534,72 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     def _should_import_animation(
         self,
         target_ext: str,
-        pack: HavokPack,
+        animations: List[parsers.HavokAnimation],
         armature_obj: Optional[bpy.types.Object],
     ) -> bool:
-        if not pack.animations:
+        if not animations:
             return False
         if target_ext == ".hka":
             return armature_obj is not None
         return True
+
+    def _resolve_animations(self, pack: HavokPack) -> List[parsers.HavokAnimation]:
+        if self.animation_index < 0:
+            return list(pack.animations)
+
+        if self.animation_index >= len(pack.animations):
+            self.report(
+                {"WARNING"},
+                f"Animation index {self.animation_index} is out of range; no animations imported",
+            )
+            return []
+
+        return [pack.animations[self.animation_index]]
+
+    def _refresh_animation_metadata(self) -> None:
+        filepath = Path(self.filepath) if self.filepath else None
+        if filepath is None or not filepath.suffix:
+            return
+
+        target_ext = Path(self.archive_entry or filepath.name).suffix.lower()
+        if target_ext not in {".hka", ".hkx"}:
+            if self.animation_metadata_key:
+                self.animation_metadata_key = ""
+                self.animation_count = 0
+                self.animation_names = ""
+            return
+
+        key = "|".join(
+            [
+                str(filepath),
+                self.archive_entry,
+                self.pak_profile,
+                self.pak_platform,
+            ]
+        )
+        if key == self.animation_metadata_key:
+            return
+
+        self.animation_metadata_key = key
+        self.animation_count = 0
+        self.animation_names = ""
+
+        try:
+            pack = load_from_path(
+                filepath,
+                entry=self.archive_entry or None,
+                pak_profile=self.pak_profile if filepath.suffix.lower() == ".pak" else None,
+                pak_platform=self.pak_platform if filepath.suffix.lower() == ".pak" else None,
+            )
+        except Exception:
+            return
+
+        self.animation_count = len(pack.animations)
+        self.animation_names = "\n".join(
+            anim.name or f"Animation {idx}" for idx, anim in enumerate(pack.animations)
+        )
+        if self.animation_index >= self.animation_count and self.animation_count:
+            self.animation_index = 0
 
     def _apply_igz_settings(self) -> None:
         igz_constants.dBuildMeshes = self.igz_build_meshes
