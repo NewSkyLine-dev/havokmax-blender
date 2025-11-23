@@ -626,6 +626,8 @@ def _read_pak_entries(path: Path, profile_name: str, endianness: str) -> List[Pa
     if magic not in (b"\x1AAGI", b"IGA\x1A"):
         return []
 
+    magic_endianness = "little" if magic == b"\x1AAGI" else "big"
+
     profile = next((p for p in _PAK_PROFILES if p["name"] == profile_name), None)
     if profile is None:
         raise ValueError(f"Unknown PAK profile '{profile_name}'")
@@ -634,6 +636,16 @@ def _read_pak_entries(path: Path, profile_name: str, endianness: str) -> List[Pa
         raise ValueError("PAK platform endianness must be 'little' or 'big'")
 
     entries = _try_layout(data, profile, endianness)
+    if entries:
+        return entries
+
+    # If the user-specified platform endianness produces nonsense (e.g.,
+    # nametable offsets of 0 or 7), fall back to the archive's declared
+    # magic-derived endianness like igArchiveExtractor does so offsets decode
+    # correctly.
+    if magic_endianness != endianness:
+        entries = _try_layout(data, profile, magic_endianness)
+
     return entries or []
 
 
