@@ -164,12 +164,6 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         default="",
     )
 
-    import_animation: bpy.props.BoolProperty(
-        name="Import animation",
-        default=True,
-        description="Generate Blender actions for each Havok animation track",
-    )
-
     igz_build_meshes: bpy.props.BoolProperty(
         name="Build meshes",
         description="Generate meshes when importing IGZ payloads",
@@ -283,11 +277,14 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             to_up=prefs.up_axis,
         ).to_4x4()
         armature_obj: Optional[bpy.types.Object] = None
-        if self.import_skeleton and pack.skeleton:
+        if target_ext == ".hka":
+            armature_obj = self._get_selected_armature(context)
+
+        if armature_obj is None and self.import_skeleton and pack.skeleton:
             armature_obj = self._build_armature(context, pack, prefs.scale, axis_mat)
         if self.import_meshes and pack.meshes:
             self._build_meshes(context, pack, prefs.scale, axis_mat, armature_obj)
-        if self.import_animation and pack.animations:
+        if self._should_import_animation(target_ext, pack, armature_obj):
             self._build_animations(context, pack, armature_obj, prefs.scale, axis_mat)
 
         self.report({"INFO"}, f"Imported {filepath.name}")
@@ -297,7 +294,6 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         layout = self.layout
         layout.prop(self, "import_meshes")
         layout.prop(self, "import_skeleton")
-        layout.prop(self, "import_animation")
         target_ext = Path(self.archive_entry or self.filepath).suffix.lower()
         layout.prop(self, "archive_entry")
         if target_ext == ".igz":
@@ -477,6 +473,26 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
             # Keep last action applied
             armature_obj.animation_data.action = action
+
+    def _get_selected_armature(
+        self, context: bpy.types.Context
+    ) -> Optional[bpy.types.Object]:
+        for obj in context.selected_objects:
+            if obj.type == "ARMATURE":
+                return obj
+        return None
+
+    def _should_import_animation(
+        self,
+        target_ext: str,
+        pack: HavokPack,
+        armature_obj: Optional[bpy.types.Object],
+    ) -> bool:
+        if not pack.animations:
+            return False
+        if target_ext == ".hka":
+            return armature_obj is not None
+        return True
 
     def _apply_igz_settings(self) -> None:
         igz_constants.dBuildMeshes = self.igz_build_meshes
