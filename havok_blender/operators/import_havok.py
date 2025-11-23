@@ -1,6 +1,6 @@
-"""Havok importer for HKX/HKT/HKA/IGZ/PAK packfiles."""
-
 from __future__ import annotations
+
+"""Havok importer for HKX/HKT/HKA/IGZ/PAK packfiles."""
 
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
