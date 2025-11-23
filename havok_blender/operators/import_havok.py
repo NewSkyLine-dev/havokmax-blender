@@ -1,4 +1,5 @@
 """Havok importer for HKX/HKT/HKA/IGZ/PAK packfiles."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -74,11 +75,13 @@ def _build_pak_tree(entries: List[parsers.PakEntry]) -> List[Dict[str, object]]:
                 }
             node = children[part]
 
-        node.update({
-            "is_dir": False,
-            "size": entry.size,
-            "mode": hex(entry.mode),
-        })
+        node.update(
+            {
+                "is_dir": False,
+                "size": entry.size,
+                "mode": hex(entry.mode),
+            }
+        )
 
     ordered: List[Dict[str, object]] = []
 
@@ -95,13 +98,17 @@ def _build_pak_tree(entries: List[parsers.PakEntry]) -> List[Dict[str, object]]:
 class HAVOK_UL_pak_entries(bpy.types.UIList):
     bl_idname = "HAVOK_UL_pak_entries"
 
-    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname):  # pragma: no cover - UI
+    def draw_item(
+        self, _context, layout, _data, item, _icon, _active_data, _active_propname
+    ):  # pragma: no cover - UI
         if self.layout_type in {"DEFAULT", "COMPACT"}:
             row = layout.row()
             indent_row = row.row()
             for _ in range(max(item.depth, 0)):
                 indent_row.separator_spacer()
-            indent_row.label(text=item.name, icon="FILE_FOLDER" if item.is_dir else "FILE_ARCHIVE")
+            indent_row.label(
+                text=item.name, icon="FILE_FOLDER" if item.is_dir else "FILE_ARCHIVE"
+            )
             if not item.is_dir:
                 row.label(text=f"{item.size} bytes")
                 row.label(text=item.mode)
@@ -142,10 +149,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     pak_platform: bpy.props.EnumProperty(
         name="Platform",
         description="Pick the platform endianness that matches the dump you are importing",
-        items=[
-            (key, label, label)
-            for key, label in PAK_PLATFORM_ENDIANNESS.items()
-        ],
+        items=[(key, label, label) for key, label in PAK_PLATFORM_ENDIANNESS.items()],
         default="little",
         update=_refresh_pak_entries,
     )
@@ -235,7 +239,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
         prefs = context.preferences.addons[__package__.split(".")[0]].preferences
         axis_mat: Matrix = axis_conversion(
-            from_forward="-Y", from_up="Z", to_forward=prefs.forward_axis, to_up=prefs.up_axis
+            from_forward="-Y",
+            from_up="Z",
+            to_forward=prefs.forward_axis,
+            to_up=prefs.up_axis,
         ).to_4x4()
         armature_obj: Optional[bpy.types.Object] = None
         if self.import_skeleton and pack.skeleton:
@@ -293,7 +300,9 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         for idx, bone in enumerate(skel.bones):
             edit_bone = armature.edit_bones.new(bone.name)
             edit_bone.head = bone.translation * scale
-            edit_bone.tail = bone.translation * scale + bone.rotation @ Vector((0.0, 0.1 * scale, 0.0))
+            edit_bone.tail = bone.translation * scale + bone.rotation @ Vector(
+                (0.0, 0.1 * scale, 0.0)
+            )
             if bone.parent >= 0 and bone.parent < len(skel.bones):
                 parent_edit_bone = armature.edit_bones[skel.bones[bone.parent].name]
                 edit_bone.parent = parent_edit_bone
@@ -329,7 +338,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             item.is_dir = node.get("is_dir", False)
             item.depth = node.get("depth", 0)
 
-        preferred = next((n for n in tree if n.get("path") == previous_path and not n["is_dir"]), None)
+        preferred = next(
+            (n for n in tree if n.get("path") == previous_path and not n["is_dir"]),
+            None,
+        )
         if preferred:
             self.archive_entry = preferred["path"]
             self.pak_active_index = tree.index(preferred)
@@ -356,7 +368,9 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     ) -> None:
         if armature_obj is None:
             armature_obj = (
-                self._build_armature(context, pack, scale, axis_mat) if pack.skeleton else None
+                self._build_armature(context, pack, scale, axis_mat)
+                if pack.skeleton
+                else None
             )
         if armature_obj is None:
             return
@@ -369,7 +383,11 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             for track_idx, track in enumerate(animation.tracks):
                 if not track:
                     continue
-                bone_idx = animation.track_to_bone[track_idx] if track_idx < len(animation.track_to_bone) else track_idx
+                bone_idx = (
+                    animation.track_to_bone[track_idx]
+                    if track_idx < len(animation.track_to_bone)
+                    else track_idx
+                )
                 if bone_idx < 0 or bone_idx >= len(pack.skeleton.bones):
                     continue
                 bone_name = pack.skeleton.bones[bone_idx].name
@@ -379,17 +397,34 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
                 data_path_loc = pose_bone.path_from_id("location")
                 data_path_rot = pose_bone.path_from_id("rotation_quaternion")
-                fcurves_loc = [action.fcurves.new(data_path_loc, index=i) for i in range(3)]
-                fcurves_rot = [action.fcurves.new(data_path_rot, index=i) for i in range(4)]
+                fcurves_loc = [
+                    action.fcurves.new(data_path_loc, index=i) for i in range(3)
+                ]
+                fcurves_rot = [
+                    action.fcurves.new(data_path_rot, index=i) for i in range(4)
+                ]
 
                 frame_count = len(track)
-                frame_rate = (animation.duration / max(frame_count - 1, 1)) if animation.duration > 0 else 1.0
+                frame_rate = (
+                    (animation.duration / max(frame_count - 1, 1))
+                    if animation.duration > 0
+                    else 1.0
+                )
                 for frame_idx, (trans, quat) in enumerate(track):
-                    frame = frame_idx * frame_rate * context.scene.render.fps / context.scene.render.fps_base
+                    frame = (
+                        frame_idx
+                        * frame_rate
+                        * context.scene.render.fps
+                        / context.scene.render.fps_base
+                    )
                     for axis, curve in enumerate(fcurves_loc):
-                        curve.keyframe_points.insert(frame, (trans[axis] * scale), options={'FAST'}).interpolation = 'LINEAR'
+                        curve.keyframe_points.insert(
+                            frame, (trans[axis] * scale), options={"FAST"}
+                        ).interpolation = "LINEAR"
                     for axis, curve in enumerate(fcurves_rot):
-                        curve.keyframe_points.insert(frame, quat[axis], options={'FAST'}).interpolation = 'LINEAR'
+                        curve.keyframe_points.insert(
+                            frame, quat[axis], options={"FAST"}
+                        ).interpolation = "LINEAR"
 
             # Keep last action applied
             armature_obj.animation_data.action = action
@@ -398,8 +433,24 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         # Mirror the io_scene_igz import path by letting its parser build Blender
         # objects directly from the binary IGZ stream.
         from ..io.igz_port.igz_file import igzFile
+        from ..io.igz_port import game_formats as igz_formats
 
-        igz = igzFile(data)
+        igz = None
+
+        match (self.pak_profile):
+            case "IMAGINATORS":
+                igz = igz_formats.sscIgzFile(data)
+            case "SSA_WII":
+                igz = igz_formats.ssaIgzFile(data)
+            case "SSA_WIIU":
+                igz = igz_formats.ssaIgzFile(data)
+            case "SWAP_FORCE":
+                igz = igz_formats.ssfIgzFile(data)
+            case "TRAP_TEAM":
+                igz = igz_formats.sttIgzFile(data)
+            case "SUPER_CHARGERS":
+                igz = igz_formats.sscIgzFile(data)
+
         igz.loadFile()
         igz.buildMeshes()
 
@@ -436,4 +487,6 @@ def _get_or_create_collection(context: bpy.types.Context, name: str):
 
 
 def menu_func_import(self, _context):
-    self.layout.operator(HAVOK_OT_import.bl_idname, text="Havok (.hkx/.hkt/.hka/.igz/.pak)")
+    self.layout.operator(
+        HAVOK_OT_import.bl_idname, text="Havok (.hkx/.hkt/.hka/.igz/.pak)"
+    )

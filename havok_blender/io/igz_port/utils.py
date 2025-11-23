@@ -12,6 +12,7 @@ class NoeBitStream:
     """
     Reimplementation of Noesis's stream functionality for reading binary data
     """
+
     data: bytes
     endian: str
     offset: int
@@ -40,43 +41,35 @@ class NoeBitStream:
 
     def readBytes(self, size: int) -> bytes:
         self._require(size)
-        bytes_data = self.data[self.offset:self.offset + size]
+        bytes_data = self.data[self.offset : self.offset + size]
         self.offset += size
         return bytes_data
 
     def readUInt(self) -> int:
-        endian = self.endian.value if hasattr(
-            self.endian, 'value') else self.endian
+        endian = self.endian.value if hasattr(self.endian, "value") else self.endian
         self._require(4)
-        val = struct.unpack(
-            f"{endian}I", self.data[self.offset:self.offset + 4])[0]
+        val = struct.unpack(f"{endian}I", self.data[self.offset : self.offset + 4])[0]
         self.offset += 4
         return val
 
     def readUInt64(self) -> int:
-        endian = self.endian.value if hasattr(
-            self.endian, 'value') else self.endian
+        endian = self.endian.value if hasattr(self.endian, "value") else self.endian
         self._require(8)
-        val = struct.unpack(
-            f"{endian}Q", self.data[self.offset:self.offset + 8])[0]
+        val = struct.unpack(f"{endian}Q", self.data[self.offset : self.offset + 8])[0]
         self.offset += 8
         return val
 
     def readInt(self) -> int:
-        endian = self.endian.value if hasattr(
-            self.endian, 'value') else self.endian
+        endian = self.endian.value if hasattr(self.endian, "value") else self.endian
         self._require(4)
-        val = struct.unpack(
-            f"{endian}i", self.data[self.offset:self.offset + 4])[0]
+        val = struct.unpack(f"{endian}i", self.data[self.offset : self.offset + 4])[0]
         self.offset += 4
         return val
 
     def readUShort(self) -> int:
-        endian = self.endian.value if hasattr(
-            self.endian, 'value') else self.endian
+        endian = self.endian.value if hasattr(self.endian, "value") else self.endian
         self._require(2)
-        val = struct.unpack(
-            endian + 'H', self.data[self.offset:self.offset + 2])[0]
+        val = struct.unpack(endian + "H", self.data[self.offset : self.offset + 2])[0]
         self.offset += 2
         return val
 
@@ -90,36 +83,30 @@ class NoeBitStream:
         start = self.offset
         while self.offset < len(self.data) and self.data[self.offset] != 0:
             self.offset += 1
-        result = self.data[start:self.offset].decode('utf-8')
+        result = self.data[start : self.offset].decode("utf-8")
         # Move past the null terminator
         if self.offset < len(self.data):
             self.offset += 1
         return result
 
     def readFloat(self) -> float:
-        endian = self.endian.value if hasattr(
-            self.endian, 'value') else self.endian
+        endian = self.endian.value if hasattr(self.endian, "value") else self.endian
         self._require(4)
-        val = struct.unpack(
-            endian + 'f', self.data[self.offset:self.offset + 4])[0]
+        val = struct.unpack(endian + "f", self.data[self.offset : self.offset + 4])[0]
         self.offset += 4
         return val
 
     def readDouble(self) -> float:
-        endian = self.endian.value if hasattr(
-            self.endian, 'value') else self.endian
+        endian = self.endian.value if hasattr(self.endian, "value") else self.endian
         self._require(8)
-        val = struct.unpack(
-            endian + 'd', self.data[self.offset:self.offset + 8])[0]
+        val = struct.unpack(endian + "d", self.data[self.offset : self.offset + 8])[0]
         self.offset += 8
         return val
 
     def readShort(self) -> int:
-        endian = self.endian.value if hasattr(
-            self.endian, 'value') else self.endian
+        endian = self.endian.value if hasattr(self.endian, "value") else self.endian
         self._require(2)
-        val = struct.unpack(
-            endian + 'h', self.data[self.offset:self.offset + 2])[0]
+        val = struct.unpack(endian + "h", self.data[self.offset : self.offset + 2])[0]
         self.offset += 2
         return val
 
@@ -127,7 +114,8 @@ class NoeBitStream:
         """Convert half precision (16-bit) float to regular float"""
         self._require(2)
         half = struct.unpack(
-            self.endian + 'H', self.data[self.offset:self.offset + 2])[0]
+            self.endian + "H", self.data[self.offset : self.offset + 2]
+        )[0]
         self.offset += 2
 
         # Extract sign, exponent, and mantissa
@@ -141,12 +129,12 @@ class NoeBitStream:
                 return -0.0 if sign else 0.0
             else:
                 # Denormalized number
-                return ((-1) ** sign) * (mantissa / 1024.0) * (2 ** -14)
+                return ((-1) ** sign) * (mantissa / 1024.0) * (2**-14)
         elif exponent == 31:
             if mantissa == 0:
-                return float('-inf') if sign else float('inf')
+                return float("-inf") if sign else float("inf")
             else:
-                return float('nan')
+                return float("nan")
 
         # Normalized number
         return ((-1) ** sign) * (1 + mantissa / 1024.0) * (2 ** (exponent - 15))
@@ -164,14 +152,15 @@ def decompressEdgeIndices(indexBuffer: bytes, indexCount: int) -> bytes:
     for i in range(indexCount):
         # Placeholder - in real implementation we would properly decompress
         idx = i % 256
-        result[i*2] = idx
-        result[i*2+1] = 0
+        result[i * 2] = idx
+        result[i * 2 + 1] = 0
 
     return bytes(result)
 
 
 class Bone:
     """Helper class for bone data"""
+
     index: int
     name: str
     parentIndex: int
@@ -181,7 +170,14 @@ class Bone:
     size_multiplier: float
     blender_bone: Any
 
-    def __init__(self, index: int, name: str, parentIndex: int, translation: Any, size_multiplier: float = 1.5) -> None:
+    def __init__(
+        self,
+        index: int,
+        name: str,
+        parentIndex: int,
+        translation: Any,
+        size_multiplier: float = 1.5,
+    ) -> None:
         self.index = index
         self.name = name if name else f"bone_{index}"
         self.parentIndex = parentIndex
@@ -198,16 +194,18 @@ class Bone:
         # Create a 4x4 matrix from the raw data - ensure correct ordering
         mtx = []
         for i in range(0, 64, 4):
-            value = struct.unpack(endian + 'f', matrix_data[i:i+4])[0]
+            value = struct.unpack(endian + "f", matrix_data[i : i + 4])[0]
             mtx.append(value)
 
         # Create matrix with correct column/row order for Blender
-        self.matrix = Matrix((
-            (mtx[0], mtx[4], mtx[8], mtx[12]),
-            (mtx[1], mtx[5], mtx[9], mtx[13]),
-            (mtx[2], mtx[6], mtx[10], mtx[14]),
-            (mtx[3], mtx[7], mtx[11], mtx[15])
-        ))
+        self.matrix = Matrix(
+            (
+                (mtx[0], mtx[4], mtx[8], mtx[12]),
+                (mtx[1], mtx[5], mtx[9], mtx[13]),
+                (mtx[2], mtx[6], mtx[10], mtx[14]),
+                (mtx[3], mtx[7], mtx[11], mtx[15]),
+            )
+        )
 
         # Matrix is stored inverted in the file, invert it
         self.matrix.invert()
@@ -227,7 +225,7 @@ class Bone:
     def create_in_blender(self, armature: Any, bone_map: dict = None) -> Any:
         """Create this bone in a Blender armature"""
         # Switch to edit mode to add bones
-        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.object.mode_set(mode="EDIT")
 
         # Create a new bone
         edit_bone = armature.edit_bones.new(self.name)
@@ -263,7 +261,7 @@ class Bone:
             return
 
         # Switch to pose mode
-        bpy.ops.object.mode_set(mode='POSE')
+        bpy.ops.object.mode_set(mode="POSE")
 
         # Get the pose bone
         if self.name in armature_obj.pose.bones:
@@ -301,7 +299,7 @@ def create_armature_from_bones(bone_list: list, name: str = "Armature") -> Any:
     armature_obj.select_set(True)
 
     # Enter edit mode
-    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.object.mode_set(mode="EDIT")
 
     # Create map for parent lookup
     bone_map = {bone.index: bone for bone in bone_list}
@@ -317,7 +315,7 @@ def create_armature_from_bones(bone_list: list, name: str = "Armature") -> Any:
             edit_bone.tail = (
                 bone.position[0],
                 bone.position[1],
-                bone.position[2] + bone.size_multiplier
+                bone.position[2] + bone.size_multiplier,
             )
 
         # Set parent if available
@@ -327,6 +325,6 @@ def create_armature_from_bones(bone_list: list, name: str = "Armature") -> Any:
                 edit_bone.parent = armature.edit_bones[parent_name]
 
     # Return to object mode
-    bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.ops.object.mode_set(mode="OBJECT")
 
     return armature_obj
