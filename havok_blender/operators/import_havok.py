@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import bpy
 from bpy_extras.io_utils import ImportHelper, axis_conversion
 from mathutils import Matrix, Vector
 
 from ..io import parsers
+from ..io.igz_port import constants as igz_constants
 from ..io.parsers import (
     HavokPack,
     load_from_path,
@@ -169,6 +170,42 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         description="Generate Blender actions for each Havok animation track",
     )
 
+    igz_build_meshes: bpy.props.BoolProperty(
+        name="Build meshes",
+        description="Generate meshes when importing IGZ payloads",
+        default=igz_constants.dBuildMeshes,
+    )
+    igz_build_bones: bpy.props.BoolProperty(
+        name="Build bones",
+        description="Create an armature from IGZ skeleton data",
+        default=igz_constants.dBuildBones,
+    )
+    igz_build_faces: bpy.props.BoolProperty(
+        name="Build faces",
+        description="Include index buffers when creating IGZ meshes",
+        default=igz_constants.dBuildFaces,
+    )
+    igz_allow_wii: bpy.props.BoolProperty(
+        name="Allow Wii models",
+        description="Permit Wii IGZ assets that may be unstable",
+        default=igz_constants.dAllowWii,
+    )
+    igz_model_threshold: bpy.props.IntProperty(
+        name="Model threshold",
+        description="Limit the number of IGZ models imported before prompting",
+        default=igz_constants.dModelThreshold,
+        min=1,
+    )
+    igz_first_object_offset: bpy.props.IntProperty(
+        name="First object offset",
+        description=(
+            "Override the offset of the first IGObject. Use -1 to import all "
+            "objects without skipping."
+        ),
+        default=igz_constants.dFirstObjectOffset,
+        min=-1,
+    )
+
     import_meshes: bpy.props.BoolProperty(
         name="Import static meshes",
         default=True,
@@ -211,6 +248,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
         target_ext = Path(self.archive_entry or filepath.name).suffix.lower()
         if target_ext == ".igz":
+            self._apply_igz_settings()
             try:
                 igz_bytes = load_igz_bytes(
                     filepath,
@@ -260,7 +298,18 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         layout.prop(self, "import_meshes")
         layout.prop(self, "import_skeleton")
         layout.prop(self, "import_animation")
+        target_ext = Path(self.archive_entry or self.filepath).suffix.lower()
         layout.prop(self, "archive_entry")
+        if target_ext == ".igz":
+            layout.use_property_split = True
+            layout.separator()
+            layout.label(text="IGZ options:")
+            layout.prop(self, "igz_build_meshes")
+            layout.prop(self, "igz_build_faces")
+            layout.prop(self, "igz_build_bones")
+            layout.prop(self, "igz_allow_wii")
+            layout.prop(self, "igz_model_threshold")
+            layout.prop(self, "igz_first_object_offset")
         if self.filepath.lower().endswith(".pak"):
             # Lazy-refresh in case the file picker did not trigger `check`.
             if not self.pak_entries:
@@ -429,30 +478,32 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             # Keep last action applied
             armature_obj.animation_data.action = action
 
+    def _apply_igz_settings(self) -> None:
+        igz_constants.dBuildMeshes = self.igz_build_meshes
+        igz_constants.dBuildBones = self.igz_build_bones
+        igz_constants.dBuildFaces = self.igz_build_faces
+        igz_constants.dAllowWii = self.igz_allow_wii
+        igz_constants.dModelThreshold = self.igz_model_threshold
+        igz_constants.dFirstObjectOffset = self.igz_first_object_offset
+
     def _import_igz_blob(self, data: bytes):
         # Mirror the io_scene_igz import path by letting its parser build Blender
         # objects directly from the binary IGZ stream.
-        from ..io.igz_port.igz_file import igzFile
         from ..io.igz_port import game_formats as igz_formats
 
-        igz = None
+        profile_to_parser: Dict[str, Callable[[bytes], object]] = {
+            "IMAGINATORS": igz_formats.sscIgzFile,
+            "SSA_WII": igz_formats.ssaIgzFile,
+            "SSA_WIIU": igz_formats.ssaIgzFile,
+            "SWAP_FORCE": igz_formats.ssfIgzFile,
+            "TRAP_TEAM": igz_formats.sttIgzFile,
+            "SUPER_CHARGERS": igz_formats.sscIgzFile,
+        }
 
-        match (self.pak_profile):
-            case "IMAGINATORS":
-                igz = igz_formats.sscIgzFile(data)
-            case "SSA_WII":
-                igz = igz_formats.ssaIgzFile(data)
-            case "SSA_WIIU":
-                igz = igz_formats.ssaIgzFile(data)
-            case "SWAP_FORCE":
-                igz = igz_formats.ssfIgzFile(data)
-            case "TRAP_TEAM":
-                igz = igz_formats.sttIgzFile(data)
-            case "SUPER_CHARGERS":
-                igz = igz_formats.sscIgzFile(data)
-
-        igz.loadFile()
-        igz.buildMeshes()
+        parser_factory = profile_to_parser.get(self.pak_profile, igz_formats.sscIgzFile)
+        parser = parser_factory(data)
+        parser.loadFile()
+        parser.buildMeshes()
 
     def _build_meshes(
         self,

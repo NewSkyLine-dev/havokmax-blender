@@ -1,14 +1,20 @@
+"""Shared constants used by the legacy IGZ importer."""
+
+from __future__ import annotations
+
 from enum import Enum
 from typing import List
 
-dBuildMeshes = True      # Whether to build the meshes or just parse the file
-dBuildBones = True       # Whether to build the bones
-dBuildFaces = True       # Whether to build the index buffer
-dAllowWii = True         # Whether to allow Wii models
+# Import configuration toggles. These are mutated by the Blender import operator
+# to expose the legacy flags without a global preferences file.
+dBuildMeshes: bool = True  # Whether to build the meshes or just parse the file
+dBuildBones: bool = True  # Whether to build the bones
+dBuildFaces: bool = True  # Whether to build the index buffer
+dAllowWii: bool = True  # Whether to allow Wii models
 # Offset of the first object to process, -1 means just loop through every object
-dFirstObjectOffset = -1
+dFirstObjectOffset: int = -1
 # The highest number of models to extract before the user is prompted
-dModelThreshold = 50
+dModelThreshold: int = 50
 
 
 class Endianness(str, Enum):
