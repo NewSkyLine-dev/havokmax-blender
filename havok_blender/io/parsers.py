@@ -664,6 +664,15 @@ def _decode_pak_entry(data: bytes, entry: PakEntry, entry_map: Dict[str, PakEntr
         decoded = _decode_deflate_chunks(data, entry)
     elif mode_prefix == 0x20:
         decoded = _decode_lzma_chunks(data, entry)
+    elif mode_prefix == 0x30:
+        # Mirrors igArchiveExtractor: the first two bytes store a size, followed
+        # by two bytes of padding, then the payload.
+        if entry.offset + 4 > len(data):
+            return b""
+        inner_size = max(0, int.from_bytes(data[entry.offset : entry.offset + 2], "little") - 2)
+        payload_start = entry.offset + 4
+        payload_end = min(payload_start + inner_size, len(data))
+        decoded = data[payload_start:payload_end]
     else:
         decoded = data[entry.offset : entry.offset + entry.size]
 
@@ -720,11 +729,19 @@ def _decode_lzma_chunks(data: bytes, entry: PakEntry) -> bytes:
         comp_bytes = data[cursor : cursor + comp_size]
         cursor += comp_size
 
-        try:
-            out_chunk = lzma.LZMADecompressor().decompress(props + comp_bytes)
-            if not out_chunk:
-                out_chunk = comp_bytes[:chunk_size]
-        except Exception:
+        # Only treat the chunk as LZMA if the properties look valid, matching
+        # igArchiveExtractor's guard rails. Otherwise, fall back to copying the
+        # raw bytes for this block.
+        props_match = props and props[0] == 0x5D and int.from_bytes(props[1:5], entry.size_endianness) <= chunk_size
+        if props_match:
+            try:
+                out_chunk = lzma.LZMADecompressor().decompress(props + comp_bytes)
+            except Exception:
+                out_chunk = b""
+        else:
+            out_chunk = b""
+
+        if not out_chunk:
             out_chunk = comp_bytes[:chunk_size]
 
         remaining = entry.size - len(out)
