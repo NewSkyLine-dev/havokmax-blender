@@ -1,9 +1,10 @@
 """Havok importer utilities for skeletons and animations.
 
-The helper functions in this module focus on Havok XML packfiles generated
-by hkxpack/hkcmd and the IGZ/PAK wrappers commonly used by Alchemy games.
-They intentionally avoid placeholder logic and instead build real transform
-tracks for Blender armatures when data is present.
+This module focuses on lightweight, self-contained parsing for the HKX/HKA
+payloads shipped with Skylanders titles. Instead of depending on external
+``havokpy`` bindings, we peel away container formats (gzip, IGZ, PAK) and
+recover the embedded Havok XML so the importer can mirror HavokMax behavior
+without native runtime dependencies.
 """
 
 from __future__ import annotations
@@ -345,7 +346,7 @@ def load_igz_bytes(
 
 
 def parse_bytes(data: bytes, override_name: Optional[str] = None) -> HavokPack:
-    """Parse Havok XML/IGZ data into skeleton and animation structures."""
+    """Parse Havok packfile bytes into skeleton and animation structures."""
 
     data = _unwrap_bytes(data)
 
@@ -519,10 +520,6 @@ def _unwrap_bytes(data: bytes) -> bytes:
     igz_payload = _maybe_from_igz(data)
     if igz_payload is not None:
         return igz_payload
-
-    embedded = _slice_embedded_havok(data)
-    if embedded is not None:
-        return embedded
 
     # Tar/zip payloads are considered higher-level PAK containers; they should
     # be handled by _extract_from_archive instead.
