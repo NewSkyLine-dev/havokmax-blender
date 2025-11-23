@@ -342,15 +342,48 @@ def parse_bytes(data: bytes, override_name: Optional[str] = None) -> HavokPack:
     """Parse Havok XML/IGZ data into skeleton and animation structures."""
 
     xml_bytes = _unwrap_bytes(data)
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError as exc:  # pragma: no cover - defensive guard
-        raise ValueError("Unsupported or corrupt Havok payload") from exc
-
+    root = _parse_xml_root(xml_bytes)
     skeleton = _parse_skeleton(root, override_name)
     animations = _parse_animations(root, skeleton)
     meshes = _parse_meshes(root, override_name)
     return HavokPack(skeleton=skeleton, animations=animations, meshes=meshes)
+
+
+def _parse_xml_root(raw_bytes: bytes) -> ET.Element:
+    """Extract an XML root from raw Havok payloads.
+
+    Havok packfiles produced by HavokLib/hkxcmd often embed their XML after a
+    binary packfile header. Blender's previous logic attempted to treat the
+    entire byte stream as XML, which fails for raw HKX/HKA exports. Instead we
+    scan for the first XML tag and parse from that point, mirroring the
+    extraction strategy used by HavokMax's conversion step.
+    """
+
+    # Fast path for already-trimmed XML payloads.
+    try:
+        return ET.fromstring(raw_bytes)
+    except ET.ParseError:
+        pass
+
+    # Some packfiles store binary headers before the XML body; locate the first
+    # plausible XML tag and retry from there.
+    xml_markers = (b"<hkpackfile", b"<?xml", b"<hkobject", b"<")
+    for marker in xml_markers:
+        start = raw_bytes.find(marker)
+        if start == -1:
+            continue
+
+        trimmed = raw_bytes[start:]
+        try:
+            return ET.fromstring(trimmed)
+        except ET.ParseError:
+            continue
+
+    # If no valid XML could be extracted, surface a clear error so callers can
+    # fall back to external conversion tools (HavokLib/hkxcmd) before re-import.
+    raise ValueError(
+        "Unsupported or corrupt Havok payload: no XML section found in packfile"
+    )
 
 
 def _unwrap_bytes(data: bytes) -> bytes:
