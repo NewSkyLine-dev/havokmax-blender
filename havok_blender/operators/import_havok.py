@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import bpy
+import mathutils
 from bpy_extras.io_utils import ImportHelper, axis_conversion
 from mathutils import Matrix, Vector
 
@@ -28,6 +29,13 @@ class HavokPakEntry(bpy.types.PropertyGroup):
     mode: bpy.props.StringProperty()
     is_dir: bpy.props.BoolProperty()
     depth: bpy.props.IntProperty()
+
+
+class HavokAnimationEntry(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty()
+    index: bpy.props.IntProperty()
+    duration: bpy.props.FloatProperty()
+    num_tracks: bpy.props.IntProperty()
 
 
 def _refresh_pak_entries(self, _context):  # pragma: no cover - UI callback
@@ -121,6 +129,22 @@ class HAVOK_UL_pak_entries(bpy.types.UIList):
             layout.label(text=item.name)
 
 
+class HAVOK_UL_animation_entries(bpy.types.UIList):
+    bl_idname = "HAVOK_UL_animation_entries"
+
+    def draw_item(
+        self, _context, layout, _data, item, _icon, _active_data, _active_propname
+    ):  # pragma: no cover - UI
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row()
+            row.label(text=item.name, icon="ACTION")
+            row.label(text=f"{item.duration:.2f}s")
+            row.label(text=f"{item.num_tracks} tracks")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=item.name)
+
+
 class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     """Import Havok HKX/HKT/HKA/IGZ/PAK data into the current scene."""
 
@@ -142,6 +166,9 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     animation_count: bpy.props.IntProperty(options={"HIDDEN"}, default=0)
     animation_names: bpy.props.StringProperty(options={"HIDDEN"}, default="")
     animation_metadata_key: bpy.props.StringProperty(options={"HIDDEN"}, default="")
+
+    animation_entries: bpy.props.CollectionProperty(type=HavokAnimationEntry)
+    animation_active_index: bpy.props.IntProperty()
 
     pak_profile: bpy.props.EnumProperty(
         name="Game version",
@@ -228,23 +255,25 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         description="Create an armature from the Havok skeleton definition",
     )
 
-    def check(self, _context):  # pragma: no cover - UI callback
-        if self.filepath.lower().endswith(".pak"):
-            if (
-                self.filepath != self.last_pak_path
-                or self.pak_profile != self.last_pak_profile
-                or self.pak_platform != self.last_pak_platform
-            ):
-                self._load_pak_entries()
-                self.last_pak_path = self.filepath
-                self.last_pak_profile = self.pak_profile
-                self.last_pak_platform = self.pak_platform
-                self._refresh_animation_metadata()
-                return True
+    animation_scale: bpy.props.FloatProperty(
+        name="Animation Scale",
+        description="Additional scaling factor for animation translation tracks",
+        default=1.0,
+        min=0.0001,
+    )
 
-        previous_key = self.animation_metadata_key
-        self._refresh_animation_metadata()
-        return previous_key != self.animation_metadata_key
+    anim_flip_x: bpy.props.BoolProperty(name="Flip X Translation")
+    anim_flip_y: bpy.props.BoolProperty(name="Flip Y Translation")
+    anim_flip_z: bpy.props.BoolProperty(name="Flip Z Translation")
+    anim_flip_quat_x: bpy.props.BoolProperty(name="Flip Quat X")
+    anim_flip_quat_y: bpy.props.BoolProperty(name="Flip Quat Y")
+    anim_flip_quat_z: bpy.props.BoolProperty(name="Flip Quat Z")
+    anim_flip_quat_w: bpy.props.BoolProperty(name="Flip Quat W")
+    anim_swap_yz: bpy.props.BoolProperty(name="Swap Y/Z Axes")
+
+    @classmethod
+    def poll(cls, context):
+        return True
 
     def execute(self, context: bpy.types.Context):
         filepath = Path(self.filepath)
@@ -296,14 +325,19 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             to_forward=prefs.forward_axis,
             to_up=prefs.up_axis,
         ).to_4x4()
-        armature_obj: Optional[bpy.types.Object] = None
-        if target_ext == ".hka":
-            armature_obj = self._get_selected_armature(context)
+
+        armature_obj = (
+            context.active_object
+            if context.active_object and context.active_object.type == "ARMATURE"
+            else None
+        )
 
         if armature_obj is None and self.import_skeleton and pack.skeleton:
             armature_obj = self._build_armature(context, pack, prefs.scale, axis_mat)
+
         if self.import_meshes and pack.meshes:
             self._build_meshes(context, pack, prefs.scale, axis_mat, armature_obj)
+
         selected_animations = self._resolve_animations(pack)
         if self._should_import_animation(target_ext, selected_animations, armature_obj):
             self._build_animations(
@@ -311,7 +345,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 pack,
                 selected_animations,
                 armature_obj,
-                prefs.scale,
+                prefs.scale * self.animation_scale,
                 axis_mat,
             )
 
@@ -328,20 +362,39 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         if target_ext in {".hka", ".hkx"}:
             layout.separator()
             layout.label(text="Animation options:")
-            layout.prop(self, "animation_index")
+            layout.prop(self, "animation_scale")
+
+            row = layout.row()
+            row.prop(self, "anim_swap_yz")
+
+            col = layout.column(align=True)
+            col.label(text="Flip Translation:")
+            row = col.row(align=True)
+            row.prop(self, "anim_flip_x", text="X")
+            row.prop(self, "anim_flip_y", text="Y")
+            row.prop(self, "anim_flip_z", text="Z")
+
+            col = layout.column(align=True)
+            col.label(text="Flip Quaternion:")
+            row = col.row(align=True)
+            row.prop(self, "anim_flip_quat_x", text="X")
+            row.prop(self, "anim_flip_quat_y", text="Y")
+            row.prop(self, "anim_flip_quat_z", text="Z")
+            row.prop(self, "anim_flip_quat_w", text="W")
+
             if self.animation_count:
-                layout.label(
-                    text=(
-                        f"Available animations: {self.animation_count}"
-                        + (" (names)" if self.animation_names.strip() else "")
-                    )
+                layout.label(text=f"Available animations: {self.animation_count}")
+                layout.template_list(
+                    "HAVOK_UL_animation_entries",
+                    "animation_entries",
+                    self,
+                    "animation_entries",
+                    self,
+                    "animation_active_index",
+                    rows=5,
                 )
-                if self.animation_names.strip():
-                    preview = self.animation_names.splitlines()[:5]
-                    for idx, name in enumerate(preview):
-                        layout.label(text=f"{idx}: {name}")
-                    if len(self.animation_names.splitlines()) > len(preview):
-                        layout.label(text="…")
+            else:
+                layout.prop(self, "animation_index")
         if target_ext == ".igz":
             layout.use_property_split = True
             layout.separator()
@@ -387,22 +440,44 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
         armature_obj.matrix_world = axis_mat @ armature_obj.matrix_world
 
+        # Calculate global transforms for all bones
+        # Havok stores bones in local (parent-relative) space, so we must accumulate them
+        global_transforms = []
+        for idx, bone in enumerate(skel.bones):
+            local_t = Matrix.Translation(bone.translation)
+            local_r = bone.rotation.to_matrix().to_4x4()
+            local_s = (
+                Matrix.Scale(bone.scale[0], 4, (1, 0, 0))
+                @ Matrix.Scale(bone.scale[1], 4, (0, 1, 0))
+                @ Matrix.Scale(bone.scale[2], 4, (0, 0, 1))
+            )
+            local_mat = local_t @ local_r @ local_s
+
+            if bone.parent >= 0 and bone.parent < len(global_transforms):
+                parent_mat = global_transforms[bone.parent]
+                global_mat = parent_mat @ local_mat
+            else:
+                global_mat = local_mat
+
+            global_transforms.append(global_mat)
+
         bpy.ops.object.mode_set(mode="EDIT")
         for idx, bone in enumerate(skel.bones):
             edit_bone = armature.edit_bones.new(bone.name)
-            edit_bone.head = bone.translation * scale
-            edit_bone.tail = bone.translation * scale + bone.rotation @ Vector(
-                (0.0, 0.1 * scale, 0.0)
-            )
+            global_mat = global_transforms[idx]
+
+            head = global_mat.to_translation() * scale
+            rot = global_mat.to_quaternion()
+
+            edit_bone.head = head
+            # Align bone Y-axis with the rotation
+            edit_bone.tail = head + rot @ Vector((0.0, 0.1 * scale, 0.0))
+
             if bone.parent >= 0 and bone.parent < len(skel.bones):
                 parent_edit_bone = armature.edit_bones[skel.bones[bone.parent].name]
                 edit_bone.parent = parent_edit_bone
-        bpy.ops.object.mode_set(mode="OBJECT")
 
-        # Apply rest pose rotations
-        for bone, pose_bone in zip(skel.bones, armature_obj.pose.bones):
-            pose_bone.rotation_mode = "QUATERNION"
-            pose_bone.rotation_quaternion = bone.rotation
+        bpy.ops.object.mode_set(mode="OBJECT")
 
         return armature_obj
 
@@ -461,41 +536,142 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         axis_mat: Matrix,
     ) -> None:
         if armature_obj is None:
-            armature_obj = (
-                self._build_armature(context, pack, scale, axis_mat)
-                if pack.skeleton
-                else None
-            )
-        if armature_obj is None:
             return
+
+        # 1. Reconstruct Havok Global Rest Poses
+        # We need this to calculate the mapping between Havok bone space and Blender bone space
+        havok_global_rest = []
+        if pack.skeleton:
+            for idx, bone in enumerate(pack.skeleton.bones):
+                # HavokBone stores the reference pose in local space
+                local_t = Matrix.Translation(bone.translation)
+                local_r = bone.rotation.to_matrix().to_4x4()
+                local_s = (
+                    Matrix.Scale(bone.scale[0], 4, (1, 0, 0))
+                    @ Matrix.Scale(bone.scale[1], 4, (0, 1, 0))
+                    @ Matrix.Scale(bone.scale[2], 4, (0, 0, 1))
+                )
+
+                local_mat = local_t @ local_r @ local_s
+
+                if bone.parent >= 0 and bone.parent < len(havok_global_rest):
+                    parent_mat = havok_global_rest[bone.parent]
+                    global_mat = parent_mat @ local_mat
+                else:
+                    global_mat = local_mat
+
+                havok_global_rest.append(global_mat)
+
+        # 2. Calculate R_fix for each bone
+        # R_fix = M_havok_rest.inverted() @ M_blender_rest
+        # M_blender_rest is bone.matrix_local
+        bone_r_fix = {}
+        blender_rest_globals = {}
+
+        bpy.ops.object.mode_set(
+            mode="EDIT"
+        )  # Ensure we are reading edit bones for rest pose?
+        # No, object mode is fine for reading data.bones
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        for bone in armature_obj.data.bones:
+            # Find corresponding Havok bone index
+            h_idx = -1
+            if pack.skeleton:
+                for i, b in enumerate(pack.skeleton.bones):
+                    if b.name == bone.name:
+                        h_idx = i
+                        break
+
+            if h_idx != -1 and h_idx < len(havok_global_rest):
+                m_havok = havok_global_rest[h_idx]
+                m_blender = bone.matrix_local  # Armature space
+
+                # R_fix maps Havok vector to Blender vector in Global space
+                # v_blender = v_havok @ R_fix ? No.
+                # M_blender = M_havok @ R_fix
+                # R_fix = M_havok.inverted() @ M_blender
+                r_fix = m_havok.inverted() @ m_blender
+                bone_r_fix[bone.name] = r_fix
+                blender_rest_globals[bone.name] = m_blender
+            else:
+                bone_r_fix[bone.name] = Matrix.Identity(4)
+                blender_rest_globals[bone.name] = bone.matrix_local
+
+        # Pre-calculate rest local matrices for all bones (Blender space)
+        rest_locals = {}
+        for bone in armature_obj.data.bones:
+            if bone.parent:
+                rest_locals[bone.name] = (
+                    bone.parent.matrix_local.inverted() @ bone.matrix_local
+                )
+            else:
+                rest_locals[bone.name] = bone.matrix_local
 
         for animation in animations:
             action = bpy.data.actions.new(animation.name)
             armature_obj.animation_data_create()
             armature_obj.animation_data.action = action
 
+            # Blender 5.0+ compatibility: Action.fcurves replaced by Layered Action API
+            fcurves_collection = None
+            if hasattr(action, "fcurves"):
+                fcurves_collection = action.fcurves
+            else:
+                # Create necessary hierarchy for Layered Action
+                slot = action.slots.new("OBJECT", "Slot")
+                layer = action.layers.new("Layer")
+                strip = layer.strips.new(type="KEYFRAME")
+                bag = strip.channelbags.new(slot)
+                fcurves_collection = bag.fcurves
+
+                # Assign the slot to the object's animation data
+                if hasattr(armature_obj.animation_data, "action_slot_handle"):
+                    armature_obj.animation_data.action_slot_handle = slot.handle
+
+            is_additive = animation.blend_hint in ("ADDITIVE", "ADDITIVE_DEPRECATED")
+
             for track_idx, track in enumerate(animation.tracks):
                 if not track:
                     continue
-                bone_idx = (
-                    animation.track_to_bone[track_idx]
-                    if track_idx < len(animation.track_to_bone)
-                    else track_idx
-                )
-                if bone_idx < 0 or bone_idx >= len(pack.skeleton.bones):
+
+                bone_name = None
+
+                # Try to find bone by annotation track name first
+                if track_idx < len(animation.annotation_tracks):
+                    annot_name = animation.annotation_tracks[track_idx]
+                    if annot_name and armature_obj.pose.bones.get(annot_name):
+                        bone_name = annot_name
+
+                # Fallback to binding indices
+                if not bone_name:
+                    bone_idx = (
+                        animation.track_to_bone[track_idx]
+                        if track_idx < len(animation.track_to_bone)
+                        else track_idx
+                    )
+                    if pack.skeleton and 0 <= bone_idx < len(pack.skeleton.bones):
+                        bone_name = pack.skeleton.bones[bone_idx].name
+
+                if not bone_name:
                     continue
-                bone_name = pack.skeleton.bones[bone_idx].name
+
                 pose_bone = armature_obj.pose.bones.get(bone_name)
                 if not pose_bone:
                     continue
 
                 data_path_loc = pose_bone.path_from_id("location")
                 data_path_rot = pose_bone.path_from_id("rotation_quaternion")
+                data_path_scale = pose_bone.path_from_id("scale")
+
                 fcurves_loc = [
-                    action.fcurves.new(data_path_loc, index=i) for i in range(3)
+                    fcurves_collection.new(data_path_loc, index=i) for i in range(3)
                 ]
                 fcurves_rot = [
-                    action.fcurves.new(data_path_rot, index=i) for i in range(4)
+                    fcurves_collection.new(data_path_rot, index=i) for i in range(4)
+                ]
+                fcurves_scale = [
+                    fcurves_collection.new(data_path_scale, index=i) for i in range(3)
                 ]
 
                 frame_count = len(track)
@@ -504,20 +680,132 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                     if animation.duration > 0
                     else 1.0
                 )
-                for frame_idx, (trans, quat) in enumerate(track):
+
+                rest_local = rest_locals.get(bone_name, Matrix.Identity(4))
+                r_fix = bone_r_fix.get(bone_name, Matrix.Identity(4))
+
+                # Parent info for global calculation
+                parent_bone = pose_bone.parent
+                parent_name = parent_bone.name if parent_bone else None
+
+                # We need to cache calculated global matrices for the current frame
+                # But tracks are processed independently. This is a problem for global calculation.
+                # However, we can assume that we only need the PARENT's global matrix.
+                # But we don't have the parent's animated global matrix yet!
+                # This approach requires processing frames time-slice by time-slice, not track by track.
+
+                # Alternative:
+                # If we assume the animation is purely local (which it is),
+                # and we want to apply it to the Blender bone.
+                # M_blender_local = M_blender_parent_global.inverted() @ M_blender_global
+                # M_blender_global = M_havok_global @ R_fix
+                # M_havok_global = M_havok_parent_global @ M_havok_local
+
+                # This dependency chain is hard to resolve track-by-track.
+
+                # SIMPLIFICATION:
+                # Assume R_fix is only a rotation (it usually is).
+                # And assume parent's R_fix is similar? No.
+
+                # Let's go back to the delta idea.
+                # D_havok = M_havok_rest_local.inverted() @ M_havok_anim_local
+                # This is the local deformation in Havok space.
+                # We want to apply this deformation to the Blender bone.
+                # But the Blender bone has a different coordinate system.
+                # If we map D_havok to Blender space:
+                # D_blender = R_fix_local.inverted() @ D_havok @ R_fix_local ?
+                # Where R_fix_local is the rotation from Havok Bone Local Space to Blender Bone Local Space.
+
+                # Is R_fix (Global) the same as R_fix_local?
+                # M_blender = M_havok @ R_fix.
+                # M_blender_local = M_blender_parent.inverted() @ M_blender
+                # = (M_havok_parent @ R_fix_parent).inverted() @ (M_havok @ R_fix)
+                # = R_fix_parent.inverted() @ M_havok_parent.inverted() @ M_havok @ R_fix
+                # = R_fix_parent.inverted() @ M_havok_local @ R_fix
+
+                # So M_blender_local depends on Parent's R_fix and Own R_fix.
+
+                # We can pre-calculate R_fix for all bones.
+                # And we can pre-calculate R_fix_parent for all bones.
+
+                r_fix_parent = Matrix.Identity(4)
+                if parent_name:
+                    r_fix_parent = bone_r_fix.get(parent_name, Matrix.Identity(4))
+
+                # Now we can calculate M_blender_local for each frame WITHOUT full global simulation.
+                # M_blender_local = R_fix_parent.inverted() @ M_havok_local @ R_fix
+
+                # This is it! This formula converts a Havok Local Transform to a Blender Local Transform
+                # preserving the global pose, accounting for axis changes in both parent and child.
+
+                r_fix_inv = r_fix.inverted()  # Wait, formula says R_fix at end.
+                r_fix_parent_inv = r_fix_parent.inverted()
+
+                for frame_idx, (trans, quat, scale_vec) in enumerate(track):
+                    # Apply user overrides
+                    t_x, t_y, t_z = trans
+                    q_w, q_x, q_y, q_z = quat.w, quat.x, quat.y, quat.z
+
+                    if self.anim_swap_yz:
+                        t_y, t_z = t_z, t_y
+                        q_y, q_z = q_z, q_y
+
+                    if self.anim_flip_x:
+                        t_x = -t_x
+                    if self.anim_flip_y:
+                        t_y = -t_y
+                    if self.anim_flip_z:
+                        t_z = -t_z
+
+                    if self.anim_flip_quat_x:
+                        q_x = -q_x
+                    if self.anim_flip_quat_y:
+                        q_y = -q_y
+                    if self.anim_flip_quat_z:
+                        q_z = -q_z
+                    if self.anim_flip_quat_w:
+                        q_w = -q_w
+
+                    trans = Vector((t_x, t_y, t_z))
+                    quat = mathutils.Quaternion((q_w, q_x, q_y, q_z))
+
+                    # Construct M_havok_local
+                    m_havok_local = (
+                        Matrix.Translation(trans)
+                        @ quat.to_matrix().to_4x4()
+                        @ Matrix.Scale(scale_vec[0], 4, (1, 0, 0))
+                        @ Matrix.Scale(scale_vec[1], 4, (0, 1, 0))
+                        @ Matrix.Scale(scale_vec[2], 4, (0, 0, 1))
+                    )
+
+                    # Calculate M_blender_local
+                    # M_blender_local = R_fix_parent.inverted() @ M_havok_local @ R_fix
+                    m_blender_local = r_fix_parent_inv @ m_havok_local @ r_fix
+
+                    # Calculate M_basis (relative to rest pose)
+                    # M_basis = rest_local.inverted() @ m_blender_local
+                    matrix_basis = rest_local.inverted() @ m_blender_local
+
+                    loc, rot, sca = matrix_basis.decompose()
+
                     frame = (
                         frame_idx
                         * frame_rate
                         * context.scene.render.fps
                         / context.scene.render.fps_base
                     )
+
                     for axis, curve in enumerate(fcurves_loc):
                         curve.keyframe_points.insert(
-                            frame, (trans[axis] * scale), options={"FAST"}
+                            frame, loc[axis], options={"FAST"}
                         ).interpolation = "LINEAR"
                     for axis, curve in enumerate(fcurves_rot):
                         curve.keyframe_points.insert(
-                            frame, quat[axis], options={"FAST"}
+                            frame, rot[axis], options={"FAST"}
+                        ).interpolation = "LINEAR"
+                    for axis, curve in enumerate(fcurves_scale):
+                        curve.keyframe_points.insert(
+                            frame, sca[axis], options={"FAST"}
                         ).interpolation = "LINEAR"
 
             # Keep last action applied
@@ -544,6 +832,17 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         return True
 
     def _resolve_animations(self, pack: HavokPack) -> List[parsers.HavokAnimation]:
+        # Use animation_active_index if available and valid
+        if self.animation_entries and 0 <= self.animation_active_index < len(
+            self.animation_entries
+        ):
+            entry = self.animation_entries[self.animation_active_index]
+            if entry.index == -1:
+                return list(pack.animations)
+            if 0 <= entry.index < len(pack.animations):
+                return [pack.animations[entry.index]]
+
+        # Fallback to legacy animation_index
         if self.animation_index < 0:
             return list(pack.animations)
 
@@ -588,8 +887,12 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             pack = load_from_path(
                 filepath,
                 entry=self.archive_entry or None,
-                pak_profile=self.pak_profile if filepath.suffix.lower() == ".pak" else None,
-                pak_platform=self.pak_platform if filepath.suffix.lower() == ".pak" else None,
+                pak_profile=(
+                    self.pak_profile if filepath.suffix.lower() == ".pak" else None
+                ),
+                pak_platform=(
+                    self.pak_platform if filepath.suffix.lower() == ".pak" else None
+                ),
             )
         except Exception:
             return
@@ -598,6 +901,23 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         self.animation_names = "\n".join(
             anim.name or f"Animation {idx}" for idx, anim in enumerate(pack.animations)
         )
+
+        self.animation_entries.clear()
+
+        # Add "All Animations" option
+        item = self.animation_entries.add()
+        item.name = "All Animations"
+        item.index = -1
+        item.duration = 0.0
+        item.num_tracks = 0
+
+        for idx, anim in enumerate(pack.animations):
+            item = self.animation_entries.add()
+            item.name = anim.name or f"Animation {idx}"
+            item.index = idx
+            item.duration = anim.duration
+            item.num_tracks = len(anim.tracks)
+
         if self.animation_index >= self.animation_count and self.animation_count:
             self.animation_index = 0
 
