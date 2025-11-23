@@ -1,15 +1,18 @@
 """Havok importer utilities for skeletons and animations.
 
-The helper functions in this module focus on Havok XML packfiles generated
-by hkxpack/hkcmd and the IGZ/PAK wrappers commonly used by Alchemy games.
-They intentionally avoid placeholder logic and instead build real transform
-tracks for Blender armatures when data is present.
+This module focuses on lightweight, self-contained parsing for the HKX/HKA
+payloads shipped with Skylanders titles. Instead of depending on external
+``havokpy`` bindings, we peel away container formats (gzip, IGZ, PAK) and
+recover the embedded Havok XML so the importer can mirror HavokMax behavior
+without native runtime dependencies.
 """
 
 from __future__ import annotations
 
+import ast
 import gzip
 import lzma
+import struct
 import tarfile
 import zipfile
 import zlib
@@ -19,8 +22,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import xml.etree.ElementTree as ET
 
 import mathutils
+from .binary_parser import BinaryReader, hkxHeader
 
-SUPPORTED_EXTENSIONS = {".hkx", ".hka", ".hkt", ".igz", ".pak"}
+SUPPORTED_EXTENSIONS = {".hkx", ".hka", ".hkt", ".igz", ".pak", ".txt"}
 
 # Platform-aware PAK parsing: users pick the game version (layout profile)
 # and target platform endianness instead of the importer guessing.
@@ -138,6 +142,7 @@ class HavokBone:
     parent: int
     translation: mathutils.Vector
     rotation: mathutils.Quaternion
+    scale: mathutils.Vector
 
 
 @dataclass
@@ -150,8 +155,10 @@ class HavokSkeleton:
 class HavokAnimation:
     name: str
     duration: float
-    tracks: List[List[Tuple[mathutils.Vector, mathutils.Quaternion]]]
+    tracks: List[List[Tuple[mathutils.Vector, mathutils.Quaternion, mathutils.Vector]]]
     track_to_bone: List[int]
+    annotation_tracks: List[str]
+    blend_hint: str = "NORMAL"
 
 
 @dataclass
@@ -339,9 +346,15 @@ def load_igz_bytes(
 
 
 def parse_bytes(data: bytes, override_name: Optional[str] = None) -> HavokPack:
-    """Parse Havok XML/IGZ data into skeleton and animation structures."""
+    """Parse Havok packfile bytes into skeleton and animation structures."""
 
-    xml_bytes = _unwrap_bytes(data)
+    data = _unwrap_bytes(data)
+
+    # Check for Havok Binary Magic (Little Endian: 57 E0 E0 57, Big Endian: 57 E0 E0 57)
+    if data.startswith(b"\x57\xe0\xe0\x57"):
+        return _parse_binary_packfile(data, override_name)
+
+    xml_bytes = data
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:  # pragma: no cover - defensive guard
@@ -353,7 +366,153 @@ def parse_bytes(data: bytes, override_name: Optional[str] = None) -> HavokPack:
     return HavokPack(skeleton=skeleton, animations=animations, meshes=meshes)
 
 
+def _parse_binary_packfile(data: bytes, override_name: Optional[str]) -> HavokPack:
+    """Parse binary Havok packfile using pure Python implementation."""
+    reader = BinaryReader(data)
+    header = hkxHeader()
+    header.load(reader)
+
+    # Get root level container
+    variants = header.get_root_level_container()
+    print(f"DEBUG: Root variants: {variants}")
+
+    skeleton = None
+    animations = []
+    meshes = []
+
+    for variant in variants:
+        if variant["class_name"] == "hkaAnimationContainer":
+            # Parse animation container
+            sid, soff = variant["variant_ptr"]
+            container = header.read_hka_animation_container(sid, soff)
+
+            # Load skeletons
+            skeletons_ptr, skeletons_size = container["skeletons"]
+            if skeletons_ptr:
+                sid, soff = skeletons_ptr
+                ptr_size = header.layout.bytes_in_pointer
+                for i in range(skeletons_size):
+                    # Array of pointers to skeletons
+                    skel_ptr = header.read_pointer(sid, soff + i * ptr_size)
+                    if skel_ptr:
+                        skel_sid, skel_soff = skel_ptr
+                        skel_data = header.read_hka_skeleton(skel_sid, skel_soff)
+
+                        # Convert to HavokSkeleton
+                        bones = []
+                        for b in skel_data["bones"]:
+                            bones.append(
+                                HavokBone(
+                                    name=b["name"],
+                                    parent=b["parent"],
+                                    translation=mathutils.Vector((0, 0, 0)),
+                                    rotation=mathutils.Quaternion((1, 0, 0, 0)),
+                                    scale=mathutils.Vector((1, 1, 1)),
+                                )
+                            )
+
+                        # Update with reference pose
+                        if skel_data["ref_poses"]:
+                            for idx, pose in enumerate(skel_data["ref_poses"]):
+                                if idx < len(bones):
+                                    bones[idx].translation = mathutils.Vector(
+                                        pose["translation"]
+                                    )
+                                    # Quaternion (x,y,z,w) -> Blender (w,x,y,z)
+                                    # HavokMax conjugates the rotation (inverse), so we must too.
+                                    q = mathutils.Quaternion(
+                                        (
+                                            pose["rotation"][3],
+                                            pose["rotation"][0],
+                                            pose["rotation"][1],
+                                            pose["rotation"][2],
+                                        )
+                                    )
+                                    bones[idx].rotation = q.conjugated()
+                                    bones[idx].scale = mathutils.Vector(pose["scale"])
+
+                        skeleton = HavokSkeleton(name=skel_data["name"], bones=bones)
+
+            # Load animations and bindings
+            bindings_ptr, bindings_size = container["bindings"]
+            bindings = []
+            if bindings_ptr:
+                sid, soff = bindings_ptr
+                ptr_size = header.layout.bytes_in_pointer
+                for i in range(bindings_size):
+                    bind_ptr = header.read_pointer(sid, soff + i * ptr_size)
+                    if bind_ptr:
+                        bsid, bsoff = bind_ptr
+                        bindings.append(header.read_hka_animation_binding(bsid, bsoff))
+
+            # Map animation ptr to binding
+            anim_to_binding = {}
+            for b in bindings:
+                anim_to_binding[b["animation_ptr"]] = b
+
+            animations_ptr, animations_size = container["animations"]
+            if animations_ptr:
+                sid, soff = animations_ptr
+                ptr_size = header.layout.bytes_in_pointer
+                for i in range(animations_size):
+                    anim_ptr = header.read_pointer(sid, soff + i * ptr_size)
+                    if anim_ptr:
+                        asid, asoff = anim_ptr
+                        anim_data = header.read_hka_animation(asid, asoff)
+
+                        binding = anim_to_binding.get(anim_ptr)
+                        track_to_bone = (
+                            binding["track_to_bone"]
+                            if binding
+                            else list(range(len(anim_data["tracks"])))
+                        )
+                        blend_hint = "NORMAL"
+                        if binding:
+                            if binding["blend_hint"] == 1:
+                                blend_hint = "ADDITIVE"
+
+                        # Convert tracks
+                        converted_tracks = []
+                        for t in anim_data["tracks"]:
+                            track_frames = []
+                            for frame in t:
+                                trans, rot, scale = frame
+                                vec = mathutils.Vector(trans)
+                                quat = mathutils.Quaternion(
+                                    (rot[3], rot[0], rot[1], rot[2])
+                                )
+                                sca = mathutils.Vector(scale)
+                                track_frames.append((vec, quat.conjugated(), sca))
+                            converted_tracks.append(track_frames)
+
+                        animations.append(
+                            HavokAnimation(
+                                name=anim_data["name"],
+                                duration=anim_data["duration"],
+                                tracks=converted_tracks,
+                                track_to_bone=track_to_bone,
+                                annotation_tracks=[],
+                                blend_hint=blend_hint,
+                            )
+                        )
+
+    return HavokPack(skeleton=skeleton, animations=animations, meshes=meshes)
+
+
 def _unwrap_bytes(data: bytes) -> bytes:
+    # Check for Python bytes string representation (e.g. b'...')
+    # Common when users copy-paste from Python console or text editors
+    if len(data) > 3 and data[0] == 98 and data[1] in (39, 34):  # b' or b"
+        try:
+            # We need to decode to string first, then eval
+            text = data.decode("utf-8", errors="ignore")
+            stripped = text.strip()
+            # Ensure it looks like a bytes literal
+            if stripped.startswith(("b'", 'b"')):
+                return ast.literal_eval(stripped)
+        except (ValueError, SyntaxError):
+            pass
+
     # IGZ and some Havok distributions are gzip-compressed.
     if data.startswith(b"\x1f\x8b"):
         return gzip.decompress(data)
@@ -361,10 +520,6 @@ def _unwrap_bytes(data: bytes) -> bytes:
     igz_payload = _maybe_from_igz(data)
     if igz_payload is not None:
         return igz_payload
-
-    embedded = _slice_embedded_havok(data)
-    if embedded is not None:
-        return embedded
 
     # Tar/zip payloads are considered higher-level PAK containers; they should
     # be handled by _extract_from_archive instead.
@@ -808,13 +963,18 @@ def _parse_skeleton(
             )
             rotation = _read_quaternion(
                 b.find("hkparam[@name='transform']"), "rotation"
-            )
+            ).conjugated()
+            scale = _read_vector(b.find("hkparam[@name='transform']"), "scale")
+            if scale.length_squared < 0.0001:
+                scale = mathutils.Vector((1.0, 1.0, 1.0))
+
             bones.append(
                 HavokBone(
                     name=bname,
                     parent=parent,
                     translation=translation,
                     rotation=rotation,
+                    scale=scale,
                 )
             )
 
@@ -883,11 +1043,34 @@ def _parse_animations(
             binding_map[anim_ref.text.strip()] = bind
 
     animations: List[HavokAnimation] = []
-    for anim_obj in root.findall(".//hkobject[@class='hkaAnimation']"):
+
+    # Pre-load annotation tracks
+    annotation_map: Dict[str, str] = {}
+    for annot_obj in root.findall(".//hkobject[@class='hkaAnnotationTrack']"):
+        annot_name = _read_text(annot_obj, "trackName", fallback="")
+        if not annot_name:
+            annot_name = _read_text(annot_obj, "name", fallback="")
+
+        # Map the object's ID (name attribute) to the track name
+        obj_id = annot_obj.attrib.get("name")
+        if obj_id:
+            annotation_map[obj_id] = annot_name
+
+    # Find all animation objects (abstract and concrete)
+    anim_objects = []
+    for obj in root.findall(".//hkobject"):
+        cls = obj.attrib.get("class", "")
+        if cls in ("hkaAnimation", "hkaInterleavedUncompressedAnimation"):
+            anim_objects.append(obj)
+
+    for anim_obj in anim_objects:
         anim_name = _read_text(anim_obj, "name", fallback="Animation")
         anim_key = anim_obj.attrib.get("name", anim_name)
         duration = float(_read_text(anim_obj, "duration", fallback="0"))
         num_tracks = int(_read_text(anim_obj, "numberOfTransformTracks", fallback="0"))
+        if num_tracks == 0:
+            num_tracks = int(_read_text(anim_obj, "numberOfTracks", fallback="0"))
+
         num_frames = int(
             _read_text(anim_obj, "numOriginalFrames", fallback="0")
         ) or int(_read_text(anim_obj, "numFrames", fallback="0"))
@@ -896,6 +1079,33 @@ def _parse_animations(
 
         binding = binding_map.get(anim_key)
         track_to_bone = _parse_binding(binding, num_tracks, skeleton)
+        blend_hint = (
+            _read_text(binding, "blendHint", fallback="NORMAL")
+            if binding is not None
+            else "NORMAL"
+        )
+
+        # Parse annotation tracks
+        annotation_tracks = []
+        annots_param = anim_obj.find("hkparam[@name='annotationTracks']")
+        if annots_param is not None:
+            # Check for embedded objects
+            for embedded in annots_param.findall("hkobject"):
+                t_name = _read_text(embedded, "trackName", fallback="")
+                if not t_name:
+                    t_name = _read_text(embedded, "name", fallback="")
+                annotation_tracks.append(t_name)
+
+            # Check for references (text content)
+            if not annotation_tracks and annots_param.text:
+                refs = annots_param.text.split()
+                for ref in refs:
+                    if ref in annotation_map:
+                        annotation_tracks.append(annotation_map[ref])
+                    else:
+                        # If reference not found, append empty or placeholder?
+                        # HavokImport.cpp uses index, so we need to keep the list aligned.
+                        annotation_tracks.append("")
 
         animations.append(
             HavokAnimation(
@@ -903,6 +1113,8 @@ def _parse_animations(
                 duration=duration,
                 tracks=tracks,
                 track_to_bone=track_to_bone,
+                annotation_tracks=annotation_tracks,
+                blend_hint=blend_hint,
             )
         )
 
@@ -911,7 +1123,7 @@ def _parse_animations(
 
 def _decode_interleaved_tracks(
     transforms_param: Optional[ET.Element], num_tracks: int, num_frames: int
-) -> List[List[Tuple[mathutils.Vector, mathutils.Quaternion]]]:
+) -> List[List[Tuple[mathutils.Vector, mathutils.Quaternion, mathutils.Vector]]]:
     if transforms_param is None or transforms_param.text is None:
         return []
 
@@ -929,19 +1141,21 @@ def _decode_interleaved_tracks(
         )
         expected = num_tracks * max(num_frames, 1) * 7
 
-    tracks: List[List[Tuple[mathutils.Vector, mathutils.Quaternion]]] = [
-        [] for _ in range(num_tracks)
-    ]
+    tracks: List[
+        List[Tuple[mathutils.Vector, mathutils.Quaternion, mathutils.Vector]]
+    ] = [[] for _ in range(num_tracks)]
     idx = 0
     for _frame in range(max(num_frames, 1)):
         for track in range(num_tracks):
             if idx + 7 > len(values):
                 break
             t = mathutils.Vector(values[idx : idx + 3])
+            # Havok XML (x, y, z, w) -> Blender (w, x, y, z)
             q = mathutils.Quaternion(
-                (values[idx + 3], values[idx + 4], values[idx + 5], values[idx + 6])
+                (values[idx + 6], values[idx + 3], values[idx + 4], values[idx + 5])
             )
-            tracks[track].append((t, q))
+            s = mathutils.Vector((1.0, 1.0, 1.0))
+            tracks[track].append((t, q.conjugated(), s))
             idx += 7
 
     return tracks
@@ -1001,4 +1215,5 @@ def _read_quaternion(
     values = [float(v) for v in param.text.split()]
     while len(values) < 4:
         values.append(0.0)
-    return mathutils.Quaternion(values[:4])
+    # Havok XML stores (x, y, z, w), Blender wants (w, x, y, z)
+    return mathutils.Quaternion((values[3], values[0], values[1], values[2]))
