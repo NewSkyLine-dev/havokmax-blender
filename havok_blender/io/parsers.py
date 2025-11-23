@@ -684,22 +684,29 @@ def _decode_deflate_chunks(data: bytes, entry: PakEntry) -> bytes:
     chunk_size = 0x8000
     cursor = entry.offset
     out = bytearray()
+    decompressed_bytes = 0
 
-    while len(out) < entry.size and cursor + entry.size_field <= len(data):
+    # Mirror igArchiveExtractor's loop: always step by the nominal 0x8000 chunk
+    # size so we don't prematurely exit when a compressed block inflates to less
+    # than the advertised payload.
+    while decompressed_bytes < entry.size and cursor + entry.size_field <= len(data):
         comp_size = int.from_bytes(data[cursor : cursor + entry.size_field], entry.size_endianness)
         cursor += entry.size_field
-        if comp_size <= 0 or cursor + comp_size > len(data):
+        if comp_size <= 0:
             break
 
-        chunk = data[cursor : cursor + comp_size]
+        chunk = data[cursor : min(cursor + comp_size, len(data))]
         cursor += comp_size
 
         try:
-            out.extend(zlib.decompress(chunk))
+            out_chunk = zlib.decompress(chunk)
         except Exception:
-            raw_len = min(chunk_size, len(chunk), entry.size - len(out))
-            out.extend(chunk[:raw_len])
+            out_chunk = chunk[:chunk_size]
 
+        remaining = entry.size - len(out)
+        out.extend(out_chunk[: min(len(out_chunk), remaining)])
+
+        decompressed_bytes += chunk_size
         cursor = _align(cursor, chunk_alignment)
 
     if not out:
