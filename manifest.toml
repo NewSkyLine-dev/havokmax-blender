@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+id = "io_scene_havok"
+version = "0.1.0"
+name = "Havok IO"
+tagline = "Import Havok HKX/HKT/HKA/IGZ/PAK assets"
+maintainer = "PredatorCZ & Blender Porters"
+type = "add-on"
+blender_version_min = "5.0.0"
+license = ["GPL-3.0-or-later"]
+website = "https://github.com/PredatorCZ/HavokMax"
+doc_url = "https://github.com/PredatorCZ/HavokMax"
+tracker_url = "https://github.com/PredatorCZ/HavokMax/issues"
+categories = ["Import-Export", "Animation", "Rigging"]
+tags = ["havok", "hkx", "animation", "skeleton"]
+platforms = ["windows-amd64", "linux-amd64", "macos-arm64"]
