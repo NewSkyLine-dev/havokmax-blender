@@ -5,14 +5,28 @@ Havok packfile reader used by the Blender importer. It focuses on
 animation data and mirrors the concepts from HavokLib/HavokMax without
 reusing any of the previous logic.
 """
+
 from __future__ import annotations
 
+import logging
 import re
 import struct
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .spline_decompressor import SplineDecompressor
+from .spline_decompressor import SplineDecompressor, TransformTrack
+
+_base_logger = logging.getLogger("havok_blender")
+if not _base_logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("[HavokIO] %(levelname)s %(name)s: %(message)s")
+    )
+    _base_logger.addHandler(handler)
+    _base_logger.setLevel(logging.INFO)
+
+logger = _base_logger.getChild("io.binary_parser")
 
 
 class BinaryReader:
@@ -150,10 +164,14 @@ class hkxHeader:
         reader.seek(section.absolute_data_start)
         section.data = bytearray(reader.read_bytes(section.local_fixups_offset))
         virtual_eof = (
-            section.imports_offset if section.exports_offset == 0xFFFFFFFF else section.exports_offset
+            section.imports_offset
+            if section.exports_offset == 0xFFFFFFFF
+            else section.exports_offset
         )
         num_local = (section.global_fixups_offset - section.local_fixups_offset) // 8
-        num_global = (section.virtual_fixups_offset - section.global_fixups_offset) // 12
+        num_global = (
+            section.virtual_fixups_offset - section.global_fixups_offset
+        ) // 12
         reader.seek(section.absolute_data_start + section.local_fixups_offset)
         local_fixups = [reader.read("ii") for _ in range(num_local)]
         reader.seek(section.absolute_data_start + section.global_fixups_offset)
@@ -161,7 +179,10 @@ class hkxHeader:
         section.pointer_map = {}
         for pointer, destination in local_fixups:
             if pointer != -1:
-                section.pointer_map[pointer] = (self.sections.index(section), destination)
+                section.pointer_map[pointer] = (
+                    self.sections.index(section),
+                    destination,
+                )
         for pointer, target_section, destination in global_fixups:
             if pointer != -1:
                 section.pointer_map[pointer] = (target_section, destination)
@@ -172,7 +193,9 @@ class hkxHeader:
             return self.sections[index]
         return None
 
-    def read_pointer(self, section_index: int, offset: int) -> Optional[Tuple[int, int]]:
+    def read_pointer(
+        self, section_index: int, offset: int
+    ) -> Optional[Tuple[int, int]]:
         section = self._section(section_index)
         if not section:
             return None
@@ -189,7 +212,9 @@ class hkxHeader:
             return None
         return (section_index, raw_val)
 
-    def read_hkarray(self, section_index: int, offset: int) -> Tuple[Optional[Tuple[int, int]], int]:
+    def read_hkarray(
+        self, section_index: int, offset: int
+    ) -> Tuple[Optional[Tuple[int, int]], int]:
         ptr_size = self.layout.bytes_in_pointer if self.layout else 4
         data_ptr = self.read_pointer(section_index, offset)
         count_offset = offset + ptr_size
@@ -262,7 +287,13 @@ class hkxHeader:
             parent_section = self._section(psid)
             for idx in range(parent_count):
                 raw = parent_section.data[poff + idx * 2 : poff + idx * 2 + 2]
-                parents.append(int.from_bytes(raw, "little" if self.layout.little_endian else "big", signed=True))
+                parents.append(
+                    int.from_bytes(
+                        raw,
+                        "little" if self.layout.little_endian else "big",
+                        signed=True,
+                    )
+                )
 
         bones: List[Dict[str, object]] = []
         if bones_ptr:
@@ -272,7 +303,12 @@ class hkxHeader:
             for idx in range(bone_count):
                 b_offset = boff + idx * bone_size
                 b_name = self.read_string_ptr(bsid, b_offset)
-                bones.append({"name": b_name, "parent": parents[idx] if idx < len(parents) else -1})
+                bones.append(
+                    {
+                        "name": b_name,
+                        "parent": parents[idx] if idx < len(parents) else -1,
+                    }
+                )
 
         ref_poses: List[Dict[str, Tuple[float, float, float]]] = []
         if ref_pose_ptr:
@@ -294,7 +330,9 @@ class hkxHeader:
         return {"name": name, "bones": bones, "ref_poses": ref_poses}
 
     # Animation container and bindings --------------------------------
-    def read_hka_animation_container(self, section_index: int, offset: int) -> Dict[str, object]:
+    def read_hka_animation_container(
+        self, section_index: int, offset: int
+    ) -> Dict[str, object]:
         ptr_size = self.layout.bytes_in_pointer if self.layout else 4
         cursor = offset + (16 if ptr_size == 8 else 8)
         skeletons_ptr, skeletons_size = self.read_hkarray(section_index, cursor)
@@ -314,7 +352,9 @@ class hkxHeader:
             "skins": (skins_ptr, skins_size),
         }
 
-    def read_hka_animation_binding(self, section_index: int, offset: int) -> Dict[str, object]:
+    def read_hka_animation_binding(
+        self, section_index: int, offset: int
+    ) -> Dict[str, object]:
         ptr_size = self.layout.bytes_in_pointer if self.layout else 4
         cursor = offset + (16 if ptr_size == 8 else 8)
         original_skeleton_name = self.read_string_ptr(section_index, cursor)
@@ -334,7 +374,13 @@ class hkxHeader:
             t_section = self._section(sid)
             for idx in range(track_to_bone_size):
                 raw = t_section.data[soff + idx * 2 : soff + idx * 2 + 2]
-                track_to_bone.append(int.from_bytes(raw, "little" if self.layout.little_endian else "big", signed=True))
+                track_to_bone.append(
+                    int.from_bytes(
+                        raw,
+                        "little" if self.layout.little_endian else "big",
+                        signed=True,
+                    )
+                )
 
         return {
             "original_skeleton_name": original_skeleton_name,
@@ -436,22 +482,30 @@ class hkxHeader:
     def _base_animation_layout(self) -> List[int]:
         year = _year_from_version(self.contents_version)
         ptr_size = self.layout.bytes_in_pointer if self.layout else 4
+        empty_base = self.layout.empty_base_class if self.layout else False
         if ptr_size == 8:
             if year >= 2016:
                 return [24, 48, 0, 28, 40, 56, 36, 32]
+            if empty_base:
+                return [-1, 0, 0, 16, 0, 0, 24, 20]
             return [16, 40, 0, 20, 32, 48, 28, 24]
         if year >= 2016:
             return [24, 48, 0, 28, 40, 56, 36, 32]
         return [8, 28, 0, 12, 24, 32, 20, 16]
 
-    def read_hka_animation(self, section_index: int, offset: int) -> Dict[str, object]:
+    def read_hka_animation(
+        self, section_index: int, offset: int, sample_tracks: bool = True
+    ) -> Dict[str, object]:
         ptr_size = self.layout.bytes_in_pointer if self.layout else 4
         offsets = self._animation_layout()
         base_offsets = self._base_animation_layout()
         section = self._section(section_index)
         endian = "little" if self.layout.little_endian else "big"
+
         def read_f32(rel: int) -> float:
-            return struct.unpack_from(("<" if endian == "little" else ">") + "f", section.data, offset + rel)[0]
+            return struct.unpack_from(
+                ("<" if endian == "little" else ">") + "f", section.data, offset + rel
+            )[0]
 
         def read_u32(rel: int) -> int:
             return int.from_bytes(section.data[offset + rel : offset + rel + 4], endian)
@@ -466,7 +520,10 @@ class hkxHeader:
         block_inverse_duration = read_f32(offsets[2])
         frame_duration = read_f32(offsets[7])
 
-        animation_name = self.read_string_ptr(section_index, offset + base_offsets[0])
+        name_offset = base_offsets[0]
+        animation_name = ""
+        if name_offset >= 0:
+            animation_name = self.read_string_ptr(section_index, offset + name_offset)
         if not animation_name:
             animation_name = "Animation"
 
@@ -478,7 +535,12 @@ class hkxHeader:
                 sid, soff = arr_ptr
                 arr_section = self._section(sid)
                 for idx in range(count):
-                    values.append(int.from_bytes(arr_section.data[soff + idx * 4 : soff + idx * 4 + 4], endian))
+                    values.append(
+                        int.from_bytes(
+                            arr_section.data[soff + idx * 4 : soff + idx * 4 + 4],
+                            endian,
+                        )
+                    )
             return values, count
 
         block_offsets, _ = read_array_ptr(offsets[3], offsets[10])
@@ -487,22 +549,42 @@ class hkxHeader:
                 num_frames = block_offsets[-1]
             elif duration > 0.0 and frame_duration > 0.0:
                 num_frames = max(1, int(round(duration / frame_duration)) + 1)
-        data_ptr = self.read_pointer(section_index, offset + offsets[4])
-        data_size = read_u32(offsets[12])
+        data_ptr, data_size = self.read_hkarray(section_index, offset + offsets[4])
         data_buffer = b""
         if data_ptr:
             dsid, doff = data_ptr
             data_section = self._section(dsid)
             data_buffer = bytes(data_section.data[doff : doff + data_size])
 
-        decompressor = SplineDecompressor(little_endian=self.layout.little_endian)
-        decompressor.decompress(
-            data_buffer=data_buffer,
-            block_offsets=block_offsets,
-            num_transform_tracks=num_transform_tracks,
-            num_float_tracks=num_float_tracks,
-        )
-        tracks = decompressor.sample_all_tracks(num_frames, frame_duration)
+        tracks: List[List[TransformTrack]] = []
+        if sample_tracks and data_buffer:
+            logger.info(
+                "read_hka_animation: starting decompression name=%s frames=%d tracks=%d",
+                animation_name,
+                num_frames,
+                num_transform_tracks,
+            )
+            decompressor = SplineDecompressor(little_endian=self.layout.little_endian)
+            decompress_start = time.perf_counter()
+            decompressor.decompress(
+                data_buffer=data_buffer,
+                block_offsets=block_offsets,
+                num_transform_tracks=num_transform_tracks,
+                num_float_tracks=num_float_tracks,
+            )
+            logger.info(
+                "read_hka_animation: decompressed name=%s in %.3fs",
+                animation_name,
+                time.perf_counter() - decompress_start,
+            )
+            sample_start = time.perf_counter()
+            tracks = decompressor.sample_all_tracks(num_frames, frame_duration)
+            logger.info(
+                "read_hka_animation: sampled name=%s produced %d tracks in %.3fs",
+                animation_name,
+                len(tracks),
+                time.perf_counter() - sample_start,
+            )
         return {
             "name": animation_name,
             "duration": duration,

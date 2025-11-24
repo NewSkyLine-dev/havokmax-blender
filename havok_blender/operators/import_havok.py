@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Havok importer for HKX/HKT/HKA/IGZ/PAK packfiles."""
 
+import logging
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -20,6 +22,17 @@ from ..io.parsers import (
     PAK_PROFILE_NAMES,
     PAK_PLATFORM_ENDIANNESS,
 )
+
+_base_logger = logging.getLogger("havok_blender")
+if not _base_logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("[HavokIO] %(levelname)s %(name)s: %(message)s")
+    )
+    _base_logger.addHandler(handler)
+    _base_logger.setLevel(logging.INFO)
+
+logger = _base_logger.getChild("operators.import_havok")
 
 
 class HavokPakEntry(bpy.types.PropertyGroup):
@@ -281,6 +294,14 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             self.report({"ERROR"}, f"Unsupported extension: {filepath.suffix}")
             return {"CANCELLED"}
 
+        import_start = time.perf_counter()
+        logger.info(
+            "Import requested path=%s entry=%s mode=%s",
+            filepath,
+            self.archive_entry,
+            filepath.suffix.lower(),
+        )
+
         if filepath.suffix.lower() == ".pak" and self.pak_entries:
             if 0 <= self.pak_active_index < len(self.pak_entries):
                 active_item = self.pak_entries[self.pak_active_index]
@@ -293,26 +314,47 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         if target_ext == ".igz":
             self._apply_igz_settings()
             try:
+                logger.info(
+                    "Loading IGZ bytes from %s entry=%s", filepath, self.archive_entry
+                )
                 igz_bytes = load_igz_bytes(
                     filepath,
                     entry=self.archive_entry or None,
                     pak_profile=pak_profile,
                     pak_platform=pak_platform,
                 )
+                logger.info("IGZ payload size=%d", len(igz_bytes))
                 self._import_igz_blob(igz_bytes)
             except Exception as exc:  # pragma: no cover - Blender reports the error
                 self.report({"ERROR"}, str(exc))
                 return {"CANCELLED"}
 
             self.report({"INFO"}, f"Imported {filepath.name}")
+            logger.info(
+                "IGZ import finished in %.2fs", time.perf_counter() - import_start
+            )
             return {"FINISHED"}
 
         try:
+            logger.info(
+                "Loading Havok packfile entry=%s profile=%s platform=%s",
+                self.archive_entry,
+                pak_profile,
+                pak_platform,
+            )
+            pack_start = time.perf_counter()
             pack = load_from_path(
                 filepath,
                 entry=self.archive_entry or None,
                 pak_profile=pak_profile,
                 pak_platform=pak_platform,
+            )
+            logger.info(
+                "Pack loaded in %.2fs (skeleton=%s animations=%d meshes=%d)",
+                time.perf_counter() - pack_start,
+                bool(pack.skeleton),
+                len(pack.animations),
+                len(pack.meshes),
             )
         except Exception as exc:  # pragma: no cover - Blender reports the error
             self.report({"ERROR"}, str(exc))
@@ -333,13 +375,17 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         )
 
         if armature_obj is None and self.import_skeleton and pack.skeleton:
+            logger.info("Building new armature from skeleton '%s'", pack.skeleton.name)
             armature_obj = self._build_armature(context, pack, prefs.scale, axis_mat)
 
         if self.import_meshes and pack.meshes:
+            logger.info("Building %d mesh(es)", len(pack.meshes))
             self._build_meshes(context, pack, prefs.scale, axis_mat, armature_obj)
 
         selected_animations = self._resolve_animations(pack)
+        logger.info("Resolved %d animation(s) for import", len(selected_animations))
         if self._should_import_animation(target_ext, selected_animations, armature_obj):
+            logger.info("Starting animation build")
             self._build_animations(
                 context,
                 pack,
@@ -350,6 +396,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             )
 
         self.report({"INFO"}, f"Imported {filepath.name}")
+        logger.info("Import finished in %.2fs", time.perf_counter() - import_start)
         return {"FINISHED"}
 
     def draw(self, context):
@@ -536,7 +583,37 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         axis_mat: Matrix,
     ) -> None:
         if armature_obj is None:
+            logger.info("Skipping animation build: no armature available")
             return
+
+        build_start = time.perf_counter()
+        logger.info(
+            "Building %d animation(s) on armature '%s'",
+            len(animations),
+            armature_obj.name,
+        )
+
+        def _write_curve_samples(
+            curve, frames: List[float], values: List[float]
+        ) -> None:
+            if not frames or not values or len(frames) != len(values):
+                if frames and values:
+                    logger.warning(
+                        "Keyframe mismatch frames=%d values=%d",
+                        len(frames),
+                        len(values),
+                    )
+                return
+            keyframes = curve.keyframe_points
+            keyframes.add(len(frames))
+            for idx, (frame_val, value) in enumerate(zip(frames, values)):
+                key = keyframes[idx]
+                key.co = (frame_val, value)
+                key.interpolation = "LINEAR"
+                if hasattr(key, "handle_left_type"):
+                    key.handle_left_type = "AUTO"
+                if hasattr(key, "handle_right_type"):
+                    key.handle_right_type = "AUTO"
 
         # 1. Reconstruct Havok Global Rest Poses
         # We need this to calculate the mapping between Havok bone space and Blender bone space
@@ -609,6 +686,13 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 rest_locals[bone.name] = bone.matrix_local
 
         for animation in animations:
+            anim_start = time.perf_counter()
+            logger.info(
+                "Creating animation '%s' duration=%.2fs tracks=%d",
+                animation.name,
+                animation.duration,
+                len(animation.tracks),
+            )
             action = bpy.data.actions.new(animation.name)
             armature_obj.animation_data_create()
             armature_obj.animation_data.action = action
@@ -633,6 +717,11 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
             for track_idx, track in enumerate(animation.tracks):
                 if not track:
+                    logger.info(
+                        "Animation '%s': track %d is empty, skipping",
+                        animation.name,
+                        track_idx,
+                    )
                     continue
 
                 bone_name = None
@@ -654,11 +743,30 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                         bone_name = pack.skeleton.bones[bone_idx].name
 
                 if not bone_name:
+                    logger.warning(
+                        "Animation '%s': track %d has no bone binding, skipping",
+                        animation.name,
+                        track_idx,
+                    )
                     continue
 
                 pose_bone = armature_obj.pose.bones.get(bone_name)
                 if not pose_bone:
+                    logger.warning(
+                        "Animation '%s': bone '%s' missing on armature, skipping track %d",
+                        animation.name,
+                        bone_name,
+                        track_idx,
+                    )
                     continue
+
+                logger.info(
+                    "Animation '%s': processing track %d -> bone '%s' (%d frames)",
+                    animation.name,
+                    track_idx,
+                    bone_name,
+                    len(track),
+                )
 
                 data_path_loc = pose_bone.path_from_id("location")
                 data_path_rot = pose_bone.path_from_id("rotation_quaternion")
@@ -680,6 +788,12 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                     if animation.duration > 0
                     else 1.0
                 )
+                fps_ratio = (
+                    context.scene.render.fps / context.scene.render.fps_base
+                    if context.scene.render.fps_base
+                    else context.scene.render.fps
+                )
+                frame_scale = frame_rate * fps_ratio
 
                 rest_local = rest_locals.get(bone_name, Matrix.Identity(4))
                 r_fix = bone_r_fix.get(bone_name, Matrix.Identity(4))
@@ -738,8 +852,14 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 # This is it! This formula converts a Havok Local Transform to a Blender Local Transform
                 # preserving the global pose, accounting for axis changes in both parent and child.
 
-                r_fix_inv = r_fix.inverted()  # Wait, formula says R_fix at end.
                 r_fix_parent_inv = r_fix_parent.inverted()
+
+                track_log_interval = max(1, len(track) // 10 or 1)
+
+                frame_numbers: List[float] = []
+                loc_samples = [[], [], []]
+                rot_samples = [[], [], [], []]
+                scale_samples = [[], [], []]
 
                 for frame_idx, (trans, quat, scale_vec) in enumerate(track):
                     # Apply user overrides
@@ -788,28 +908,47 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
                     loc, rot, sca = matrix_basis.decompose()
 
-                    frame = (
-                        frame_idx
-                        * frame_rate
-                        * context.scene.render.fps
-                        / context.scene.render.fps_base
-                    )
+                    frame_value = frame_idx * frame_scale
+                    frame_numbers.append(frame_value)
 
-                    for axis, curve in enumerate(fcurves_loc):
-                        curve.keyframe_points.insert(
-                            frame, loc[axis], options={"FAST"}
-                        ).interpolation = "LINEAR"
-                    for axis, curve in enumerate(fcurves_rot):
-                        curve.keyframe_points.insert(
-                            frame, rot[axis], options={"FAST"}
-                        ).interpolation = "LINEAR"
-                    for axis, curve in enumerate(fcurves_scale):
-                        curve.keyframe_points.insert(
-                            frame, sca[axis], options={"FAST"}
-                        ).interpolation = "LINEAR"
+                    for axis in range(3):
+                        loc_samples[axis].append(loc[axis])
+                        scale_samples[axis].append(sca[axis])
+                    for axis in range(4):
+                        rot_samples[axis].append(rot[axis])
+
+                    if (
+                        frame_idx % track_log_interval == 0
+                        or frame_idx == len(track) - 1
+                    ):
+                        logger.debug(
+                            "Animation '%s': track %d frame %d/%d applied",
+                            animation.name,
+                            track_idx,
+                            frame_idx + 1,
+                            len(track),
+                        )
+
+                for axis, curve in enumerate(fcurves_loc):
+                    _write_curve_samples(curve, frame_numbers, loc_samples[axis])
+                for axis, curve in enumerate(fcurves_rot):
+                    _write_curve_samples(curve, frame_numbers, rot_samples[axis])
+                for axis, curve in enumerate(fcurves_scale):
+                    _write_curve_samples(curve, frame_numbers, scale_samples[axis])
+
+            logger.info(
+                "Finished animation '%s' in %.2fs",
+                animation.name,
+                time.perf_counter() - anim_start,
+            )
 
             # Keep last action applied
             armature_obj.animation_data.action = action
+
+        logger.info(
+            "Finished building animations in %.2fs",
+            time.perf_counter() - build_start,
+        )
 
     def _get_selected_armature(
         self, context: bpy.types.Context
@@ -893,6 +1032,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 pak_platform=(
                     self.pak_platform if filepath.suffix.lower() == ".pak" else None
                 ),
+                metadata_only=True,
             )
         except Exception:
             return
