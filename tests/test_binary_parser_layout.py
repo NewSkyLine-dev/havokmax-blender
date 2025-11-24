@@ -26,7 +26,13 @@ sys.modules.setdefault(
     types.SimpleNamespace(ImportHelper=ImportHelper, axis_conversion=lambda **_: None),
 )
 
-from havok_blender.io.binary_parser import _year_from_version, hkxHeader, BinaryReader
+from havok_blender.io.binary_parser import (
+    BinaryReader,
+    HkxLayout,
+    Section,
+    _year_from_version,
+    hkxHeader,
+)
 
 
 def test_year_from_version():
@@ -54,3 +60,38 @@ def test_header_parses_basic_layout():
     assert hk.layout.bytes_in_pointer == 8
     assert hk.layout.little_endian is True
     assert len(hk.sections) == 1
+
+
+def test_animation_frame_count_falls_back_to_duration():
+    hk = hkxHeader()
+    hk.layout = HkxLayout(bytes_in_pointer=4, little_endian=True, reuse_padding=False, empty_base_class=False)
+    hk.contents_version = "hk_2015"
+
+    data_size = 140
+    section = Section(
+        tag="__data",
+        absolute_data_start=0,
+        local_fixups_offset=0,
+        global_fixups_offset=0,
+        virtual_fixups_offset=0,
+        exports_offset=0,
+        imports_offset=0,
+        buffer_size=data_size,
+        data=bytearray(data_size),
+        pointer_map={},
+    )
+    hk.sections = [section]
+
+    offsets = hk._animation_layout()
+    base_offsets = hk._base_animation_layout()
+
+    struct.pack_into("<f", section.data, base_offsets[3], 2.0)  # duration seconds
+    struct.pack_into("<f", section.data, offsets[7], 0.5)  # frame duration seconds
+    section.data[base_offsets[7] : base_offsets[7] + 4] = (1).to_bytes(4, "little")  # transform tracks
+    section.data[base_offsets[6] : base_offsets[6] + 4] = (0).to_bytes(4, "little")  # float tracks
+    section.data[offsets[10] : offsets[10] + 4] = (0).to_bytes(4, "little")  # block offset count
+    section.data[offsets[11] : offsets[11] + 4] = (0).to_bytes(4, "little")  # num blocks
+
+    animation = hk.read_hka_animation(0, 0)
+    assert animation["num_frames"] == 5
+    assert animation["frame_duration"] == struct.unpack_from("<f", section.data, offsets[7])[0]

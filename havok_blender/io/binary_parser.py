@@ -482,6 +482,11 @@ class hkxHeader:
             return values, count
 
         block_offsets, _ = read_array_ptr(offsets[3], offsets[10])
+        if num_frames == 0:
+            if block_offsets:
+                num_frames = block_offsets[-1]
+            elif duration > 0.0 and frame_duration > 0.0:
+                num_frames = max(1, int(round(duration / frame_duration)) + 1)
         data_ptr = self.read_pointer(section_index, offset + offsets[4])
         data_size = read_u32(offsets[12])
         data_buffer = b""
