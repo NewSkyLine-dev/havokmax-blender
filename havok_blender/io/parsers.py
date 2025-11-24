@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import ast
 import gzip
+import logging
 import lzma
 import struct
 import tarfile
+import time
 import zipfile
 import zlib
 from dataclasses import dataclass
@@ -23,6 +25,17 @@ import xml.etree.ElementTree as ET
 
 import mathutils
 from .binary_parser import BinaryReader, hkxHeader
+
+_base_logger = logging.getLogger("havok_blender")
+if not _base_logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("[HavokIO] %(levelname)s %(name)s: %(message)s")
+    )
+    _base_logger.addHandler(handler)
+    _base_logger.setLevel(logging.INFO)
+
+logger = _base_logger.getChild("io.parsers")
 
 SUPPORTED_EXTENSIONS = {".hkx", ".hka", ".hkt", ".igz", ".pak", ".txt"}
 
@@ -309,6 +322,7 @@ def load_from_path(
     entry: Optional[str] = None,
     pak_profile: Optional[str] = None,
     pak_platform: Optional[str] = None,
+    metadata_only: bool = False,
 ) -> HavokPack:
     """Load any supported Havok source from disk.
 
@@ -317,13 +331,23 @@ def load_from_path(
         entry: optional archive entry for PAK/ZIP containers.
     """
 
+    logger.debug(
+        "load_from_path: path=%s entry=%s metadata_only=%s profile=%s platform=%s",
+        path,
+        entry,
+        metadata_only,
+        pak_profile,
+        pak_platform,
+    )
+
     suffix = path.suffix.lower()
     if suffix == ".pak":
         data = _extract_from_archive(path, entry, pak_profile, pak_platform)
     else:
         data = path.read_bytes()
 
-    return parse_bytes(data, override_name=path.stem)
+    logger.debug("load_from_path: read %d bytes from %s", len(data), path)
+    return parse_bytes(data, override_name=path.stem, metadata_only=metadata_only)
 
 
 def load_igz_bytes(
@@ -345,14 +369,24 @@ def load_igz_bytes(
     return path.read_bytes()
 
 
-def parse_bytes(data: bytes, override_name: Optional[str] = None) -> HavokPack:
+def parse_bytes(
+    data: bytes,
+    override_name: Optional[str] = None,
+    metadata_only: bool = False,
+) -> HavokPack:
     """Parse Havok packfile bytes into skeleton and animation structures."""
 
+    logger.debug(
+        "parse_bytes: size=%d override=%s metadata_only=%s",
+        len(data),
+        override_name,
+        metadata_only,
+    )
     data = _unwrap_bytes(data)
 
     # Check for Havok Binary Magic (Little Endian: 57 E0 E0 57, Big Endian: 57 E0 E0 57)
     if data.startswith(b"\x57\xe0\xe0\x57"):
-        return _parse_binary_packfile(data, override_name)
+        return _parse_binary_packfile(data, override_name, metadata_only)
 
     xml_bytes = data
     try:
@@ -363,24 +397,44 @@ def parse_bytes(data: bytes, override_name: Optional[str] = None) -> HavokPack:
     skeleton = _parse_skeleton(root, override_name)
     animations = _parse_animations(root, skeleton)
     meshes = _parse_meshes(root, override_name)
+    logger.debug(
+        "parse_bytes: parsed xml skeleton=%s animations=%d meshes=%d",
+        bool(skeleton),
+        len(animations),
+        len(meshes),
+    )
     return HavokPack(skeleton=skeleton, animations=animations, meshes=meshes)
 
 
-def _parse_binary_packfile(data: bytes, override_name: Optional[str]) -> HavokPack:
+def _parse_binary_packfile(
+    data: bytes, override_name: Optional[str], metadata_only: bool
+) -> HavokPack:
     """Parse binary Havok packfile using pure Python implementation."""
     reader = BinaryReader(data)
     header = hkxHeader()
     header.load(reader)
 
+    logger.info(
+        "_parse_binary_packfile: override=%s metadata_only=%s sections=%d",
+        override_name,
+        metadata_only,
+        len(header.sections),
+    )
+
     # Get root level container
     variants = header.get_root_level_container()
-    print(f"DEBUG: Root variants: {variants}")
+    logger.info("_parse_binary_packfile: root variants=%d", len(variants))
 
     skeleton = None
     animations = []
     meshes = []
 
     for variant in variants:
+        logger.info(
+            "Processing variant name=%s class=%s",
+            variant.get("name"),
+            variant.get("class_name"),
+        )
         if variant["class_name"] == "hkaAnimationContainer":
             # Parse animation container
             sid, soff = variant["variant_ptr"]
@@ -389,6 +443,7 @@ def _parse_binary_packfile(data: bytes, override_name: Optional[str]) -> HavokPa
             # Load skeletons
             skeletons_ptr, skeletons_size = container["skeletons"]
             if skeletons_ptr:
+                logger.info("Loading %d skeleton(s) from container", skeletons_size)
                 sid, soff = skeletons_ptr
                 ptr_size = header.layout.bytes_in_pointer
                 for i in range(skeletons_size):
@@ -437,6 +492,7 @@ def _parse_binary_packfile(data: bytes, override_name: Optional[str]) -> HavokPa
             bindings_ptr, bindings_size = container["bindings"]
             bindings = []
             if bindings_ptr:
+                logger.info("Loading %d animation binding(s)", bindings_size)
                 sid, soff = bindings_ptr
                 ptr_size = header.layout.bytes_in_pointer
                 for i in range(bindings_size):
@@ -452,13 +508,30 @@ def _parse_binary_packfile(data: bytes, override_name: Optional[str]) -> HavokPa
 
             animations_ptr, animations_size = container["animations"]
             if animations_ptr:
+                logger.info(
+                    "Loading %d animation(s) (metadata_only=%s)",
+                    animations_size,
+                    metadata_only,
+                )
                 sid, soff = animations_ptr
                 ptr_size = header.layout.bytes_in_pointer
                 for i in range(animations_size):
                     anim_ptr = header.read_pointer(sid, soff + i * ptr_size)
                     if anim_ptr:
                         asid, asoff = anim_ptr
-                        anim_data = header.read_hka_animation(asid, asoff)
+                        anim_start = time.perf_counter()
+                        anim_data = header.read_hka_animation(
+                            asid, asoff, sample_tracks=not metadata_only
+                        )
+                        logger.info(
+                            "read_hka_animation[%d/%d] name=%s tracks=%d sample=%s took=%.3fs",
+                            i + 1,
+                            animations_size,
+                            anim_data.get("name"),
+                            len(anim_data.get("tracks", [])),
+                            not metadata_only,
+                            time.perf_counter() - anim_start,
+                        )
 
                         binding = anim_to_binding.get(anim_ptr)
                         track_to_bone = (
@@ -472,10 +545,19 @@ def _parse_binary_packfile(data: bytes, override_name: Optional[str]) -> HavokPa
                                 blend_hint = "ADDITIVE"
 
                         # Convert tracks
+                        convert_start = time.perf_counter()
+                        total_frames = sum(len(track) for track in anim_data["tracks"])
+                        logger.info(
+                            "Converting animation '%s' tracks=%d total_frames=%d",
+                            anim_data["name"],
+                            len(anim_data["tracks"]),
+                            total_frames,
+                        )
+
                         converted_tracks = []
-                        for t in anim_data["tracks"]:
+                        for track_index, t in enumerate(anim_data["tracks"]):
                             track_frames = []
-                            for frame in t:
+                            for frame_idx, frame in enumerate(t):
                                 trans, rot, scale = frame
                                 vec = mathutils.Vector(trans)
                                 quat = mathutils.Quaternion(
@@ -483,6 +565,12 @@ def _parse_binary_packfile(data: bytes, override_name: Optional[str]) -> HavokPa
                                 )
                                 sca = mathutils.Vector(scale)
                                 track_frames.append((vec, quat.conjugated(), sca))
+                                if frame_idx == 0:
+                                    logger.debug(
+                                        "Converted first frame of track %d for '%s'",
+                                        track_index,
+                                        anim_data["name"],
+                                    )
                             converted_tracks.append(track_frames)
 
                         animations.append(
@@ -495,7 +583,17 @@ def _parse_binary_packfile(data: bytes, override_name: Optional[str]) -> HavokPa
                                 blend_hint=blend_hint,
                             )
                         )
+                        logger.info(
+                            "Converted animation '%s' in %.3fs",
+                            anim_data["name"],
+                            time.perf_counter() - convert_start,
+                        )
 
+    logger.info(
+        "_parse_binary_packfile: finished skeleton=%s animations=%d",
+        bool(skeleton),
+        len(animations),
+    )
     return HavokPack(skeleton=skeleton, animations=animations, meshes=meshes)
 
 

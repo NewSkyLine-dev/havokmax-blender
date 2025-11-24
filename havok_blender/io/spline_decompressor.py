@@ -1,159 +1,207 @@
-import struct
+"""Spline compressed Havok animation decompression.
+
+This module reimplements the spline decompression routines used by
+HavokLib/HavokMax in pure Python so Blender can import HKA/HKX animation
+tracks without relying on the legacy logic that previously lived here.
+
+The implementation mirrors the structure of ``hka_spline_decompressor``
+from HavokLib:
+* Transform masks drive whether each component is dynamic, static, or
+  implicitly identity.
+* Dynamic components are stored as B-spline control points with shared
+  knot vectors per transform component.
+* Static components are decoded once per block and reused for all frames
+  inside the block.
+* Rotations support the 32/40/48-bit compressed quaternion encodings
+  alongside uncompressed values.
+"""
+
+from __future__ import annotations
+
 import math
-
-# Enums
-STT_DYNAMIC = 0
-STT_STATIC = 1
-STT_IDENTITY = 2
-
-QT_8bit = 0
-QT_16bit = 1
-QT_32bit = 2
-QT_40bit = 3
-QT_48bit = 4
-
-ttPosX = 0
-ttPosY = 1
-ttPosZ = 2
-ttRotation = 3
-ttScaleX = 4
-ttScaleY = 5
-ttScaleZ = 6
+import struct
+import logging
+import time
+from dataclasses import dataclass
+from typing import List, Sequence, Tuple
 
 
+_base_logger = logging.getLogger("havok_blender")
+if not _base_logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("[HavokIO] %(levelname)s %(name)s: %(message)s")
+    )
+    _base_logger.addHandler(handler)
+    _base_logger.setLevel(logging.INFO)
+
+logger = _base_logger.getChild("io.spline_decompressor")
+
+
+class SplineTrackType:
+    DYNAMIC = 0
+    STATIC = 1
+    IDENTITY = 2
+
+
+class QuantizationType:
+    QT_8BIT = 0
+    QT_16BIT = 1
+    QT_32BIT = 2
+    QT_40BIT = 3
+    QT_48BIT = 4
+    QT_24BIT = 5
+    QT_16BIT_QUAT = 6
+    QT_UNCOMPRESSED = 7
+
+
+class TransformType:
+    POS_X = 0
+    POS_Y = 1
+    POS_Z = 2
+    ROTATION = 3
+    SCALE_X = 4
+    SCALE_Y = 5
+    SCALE_Z = 6
+
+
+@dataclass(frozen=True)
 class TransformMask:
-    def __init__(self, data):
-        # data is 4 bytes
-        self.quantizationTypes = data[0]
-        self.positionTypes = data[1]
-        self.rotationTypes = data[2]
-        self.scaleTypes = data[3]
+    quantization_types: int
+    position_types: int
+    rotation_types: int
+    scale_types: int
 
-    def get_pos_quantization_type(self):
-        return self.quantizationTypes & 3
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "TransformMask":
+        if len(payload) != 4:
+            raise ValueError("TransformMask requires exactly 4 bytes")
+        return cls(payload[0], payload[1], payload[2], payload[3])
 
-    def get_rot_quantization_type(self):
-        return ((self.quantizationTypes >> 2) & 0xF) + 2
+    def _flag(self, flags: int, static_bit: int, dynamic_bit: int) -> int:
+        if flags & (1 << static_bit):
+            return SplineTrackType.STATIC
+        if flags & (1 << dynamic_bit):
+            return SplineTrackType.DYNAMIC
+        return SplineTrackType.IDENTITY
 
-    def get_scale_quantization_type(self):
-        return (self.quantizationTypes >> 6) & 3
+    def sub_track_type(self, transform: int) -> int:
+        if transform == TransformType.POS_X:
+            return self._flag(self.position_types, 0, 4)
+        if transform == TransformType.POS_Y:
+            return self._flag(self.position_types, 1, 5)
+        if transform == TransformType.POS_Z:
+            return self._flag(self.position_types, 2, 6)
+        if transform == TransformType.ROTATION:
+            if self.rotation_types & 0xF0:
+                return SplineTrackType.DYNAMIC
+            if self.rotation_types & 0x0F:
+                return SplineTrackType.STATIC
+            return SplineTrackType.IDENTITY
+        if transform == TransformType.SCALE_X:
+            return self._flag(self.scale_types, 0, 4)
+        if transform == TransformType.SCALE_Y:
+            return self._flag(self.scale_types, 1, 5)
+        if transform == TransformType.SCALE_Z:
+            return self._flag(self.scale_types, 2, 6)
+        return SplineTrackType.IDENTITY
 
-    def get_sub_track_type(self, type_idx):
-        if type_idx == ttPosX:
-            if self.positionTypes & (1 << 0):
-                return STT_STATIC
-            if self.positionTypes & (1 << 4):
-                return STT_DYNAMIC
-            return STT_IDENTITY
-        elif type_idx == ttPosY:
-            if self.positionTypes & (1 << 1):
-                return STT_STATIC
-            if self.positionTypes & (1 << 5):
-                return STT_DYNAMIC
-            return STT_IDENTITY
-        elif type_idx == ttPosZ:
-            if self.positionTypes & (1 << 2):
-                return STT_STATIC
-            if self.positionTypes & (1 << 6):
-                return STT_DYNAMIC
-            return STT_IDENTITY
-        elif type_idx == ttRotation:
-            if self.rotationTypes & 0xF0:
-                return STT_DYNAMIC
-            if self.rotationTypes & 0xF:
-                return STT_STATIC
-            return STT_IDENTITY
-        elif type_idx == ttScaleX:
-            if self.scaleTypes & (1 << 0):
-                return STT_STATIC
-            if self.scaleTypes & (1 << 4):
-                return STT_DYNAMIC
-            return STT_IDENTITY
-        elif type_idx == ttScaleY:
-            if self.scaleTypes & (1 << 1):
-                return STT_STATIC
-            if self.scaleTypes & (1 << 5):
-                return STT_DYNAMIC
-            return STT_IDENTITY
-        elif type_idx == ttScaleZ:
-            if self.scaleTypes & (1 << 2):
-                return STT_STATIC
-            if self.scaleTypes & (1 << 6):
-                return STT_DYNAMIC
-            return STT_IDENTITY
-        return STT_IDENTITY
+    def pos_quantization(self) -> int:
+        return self.quantization_types & 0x3
+
+    def rot_quantization(self) -> int:
+        return ((self.quantization_types >> 2) & 0xF) + 2
+
+    def scale_quantization(self) -> int:
+        return (self.quantization_types >> 6) & 0x3
 
 
-def apply_padding(offset, alignment=4):
-    result = offset & (alignment - 1)
-    if result:
-        return offset + (alignment - result)
+def _apply_padding(offset: int, alignment: int = 4) -> int:
+    remainder = offset & (alignment - 1)
+    if remainder:
+        return offset + (alignment - remainder)
     return offset
 
 
-def read_32_quat(data, offset, endian="<"):
-    # 4 bytes
-    cVal = struct.unpack_from(endian + "I", data, offset)[0]
+def _read_f32(data: bytes, offset: int, little_endian: bool) -> float:
+    fmt = "<f" if little_endian else ">f"
+    return struct.unpack_from(fmt, data, offset)[0]
 
-    rMask = (1 << 10) - 1
-    rFrac = 1.0 / 1023.0
 
-    fPI = 3.14159265
-    fPI2 = 0.5 * fPI
-    fPI4 = 0.5 * fPI2
-    phiFrac = fPI2 / 511.0
+def _read_u16(data: bytes, offset: int, little_endian: bool) -> int:
+    fmt = "<H" if little_endian else ">H"
+    return struct.unpack_from(fmt, data, offset)[0]
 
-    R = float((cVal >> 18) & rMask) * rFrac
-    R = 1.0 - (R * R)
 
-    phiTheta = float(cVal & 0x3FFFF)
+def _read_u8(data: bytes, offset: int) -> int:
+    return data[offset]
 
-    phi = math.floor(math.sqrt(phiTheta))
+
+def _read32_quat(
+    data: bytes, offset: int, little_endian: bool
+) -> Tuple[float, float, float, float]:
+    fmt = "<I" if little_endian else ">I"
+    c_val = struct.unpack_from(fmt, data, offset)[0]
+    r_mask = (1 << 10) - 1
+    r_frac = 1.0 / 1023.0
+    f_pi = math.pi
+    f_pi2 = 0.5 * f_pi
+    f_pi4 = 0.5 * f_pi2
+    phi_frac = f_pi2 / 511.0
+
+    r = float((c_val >> 18) & r_mask) * r_frac
+    r = 1.0 - (r * r)
+
+    phi_theta = float(c_val & 0x3FFFF)
+    phi = math.floor(math.sqrt(phi_theta))
     theta = 0.0
-
     if phi > 0.0:
-        theta = fPI4 * (phiTheta - (phi * phi)) / phi
-        phi = phiFrac * phi
+        theta = f_pi4 * (phi_theta - (phi * phi)) / phi
+        phi = phi_frac * phi
 
-    magnitude = math.sqrt(max(0.0, 1.0 - R * R))
-    sPhi = math.sin(phi)
-    cPhi = math.cos(phi)
-    sTheta = math.sin(theta)
-    cTheta = math.cos(theta)
+    magnitude = math.sqrt(max(0.0, 1.0 - r * r))
+    s_phi = math.sin(phi)
+    c_phi = math.cos(phi)
+    s_theta = math.sin(theta)
+    c_theta = math.cos(theta)
 
-    x = sPhi * cTheta * magnitude
-    y = sPhi * sTheta * magnitude
-    z = cPhi * magnitude
-    w = float(((cVal >> 18) & rMask)) * rFrac
+    x = s_phi * c_theta * magnitude
+    y = s_phi * s_theta * magnitude
+    z = c_phi * magnitude
+    w = float((c_val >> 18) & r_mask) * r_frac
     w = 1.0 - (w * w)
 
-    if (cVal & 0x10000000) == 0x10000000:
+    if c_val & 0x10000000:
         x = -x
-    if (cVal & 0x20000000) == 0x20000000:
+    if c_val & 0x20000000:
         y = -y
-    if (cVal & 0x40000000) == 0x40000000:
+    if c_val & 0x40000000:
         z = -z
-    if (cVal & 0x80000000) == 0x80000000:
+    if c_val & 0x80000000:
         w = -w
 
-    return (x, y, z, w), offset + 4
+    return (x, y, z, w)
 
 
-def read_40_quat(data, offset, endian="<"):
-    # 5 bytes
-    if offset + 8 > len(data):
-        chunk = data[offset:] + b"\x00" * (8 - (len(data) - offset))
-        cVal0 = struct.unpack(endian + "Q", chunk)[0]
+def _read40_quat(
+    data: bytes, offset: int, little_endian: bool
+) -> Tuple[float, float, float, float]:
+    fmt = "<Q" if little_endian else ">Q"
+    remaining = len(data) - offset
+    if remaining >= 8:
+        raw = struct.unpack_from(fmt, data, offset)[0]
     else:
-        cVal0 = struct.unpack_from(endian + "Q", data, offset)[0]
+        if remaining <= 0:
+            chunk = b"\0" * 8
+        else:
+            chunk = data[offset : offset + remaining] + b"\0" * (8 - remaining)
+        raw = struct.unpack(fmt, chunk)[0]
 
     fractal = 0.000345436
+    x_raw = raw & 0xFFF
+    y_raw = (raw >> 12) & 0xFFF
+    z_raw = (raw >> 24) & 0xFFF
 
-    x_raw = (cVal0) & 0xFFF
-    y_raw = (cVal0 >> 12) & 0xFFF
-    z_raw = (cVal0 >> 24) & 0xFFF
-
-    # C++ reference uses 2049 subtraction (IVector4A16(tmpVal) - (1 << 11) - 1)
     x = (float(x_raw) - 2049.0) * fractal
     y = (float(y_raw) - 2049.0) * fractal
     z = (float(z_raw) - 2049.0) * fractal
@@ -161,360 +209,522 @@ def read_40_quat(data, offset, endian="<"):
     w_sq = 1.0 - (x * x + y * y + z * z)
     w = math.sqrt(max(0.0, w_sq))
 
-    if (cVal0 >> 38) & 1:
+    if (raw >> 38) & 1:
         w = -w
 
-    resultShift = (cVal0 >> 36) & 3
-    res = [x, y, z, w]
-
-    if resultShift == 0:
-        return (res[3], res[0], res[1], res[2]), offset + 5
-    elif resultShift == 1:
-        return (res[0], res[3], res[1], res[2]), offset + 5
-    elif resultShift == 2:
-        return (res[0], res[1], res[3], res[2]), offset + 5
-    else:
-        return (res[0], res[1], res[2], res[3]), offset + 5
+    shift = (raw >> 36) & 3
+    values = [x, y, z, w]
+    if shift == 0:
+        return (values[3], values[0], values[1], values[2])
+    if shift == 1:
+        return (values[0], values[3], values[1], values[2])
+    if shift == 2:
+        return (values[0], values[1], values[3], values[2])
+    return (values[0], values[1], values[2], values[3])
 
 
-def read_48_quat(data, offset, endian="<"):
-    # 6 bytes
-    vals = struct.unpack_from(endian + "hhh", data, offset)
-    vx, vy, vz = vals
-
-    resultShift = ((vy >> 14) & 2) | ((vx >> 15) & 1)
-    rSign = (vz >> 15) != 0
-
+def _read48_quat(
+    data: bytes, offset: int, little_endian: bool
+) -> Tuple[float, float, float, float]:
+    fmt = "<hhh" if little_endian else ">hhh"
+    vx, vy, vz = struct.unpack_from(fmt, data, offset)
+    result_shift = ((vy >> 14) & 2) | ((vx >> 15) & 1)
+    r_sign = (vz >> 15) != 0
     mask = 0x7FFF
     fractal = 0.000043161
-
     x = (float(vx & mask) - 16383.0) * fractal
     y = (float(vy & mask) - 16383.0) * fractal
     z = (float(vz & mask) - 16383.0) * fractal
-
     w_sq = 1.0 - (x * x + y * y + z * z)
     w = math.sqrt(max(0.0, w_sq))
-
-    if rSign:
+    if r_sign:
         w = -w
-
-    res = [x, y, z, w]
-
-    if resultShift == 0:
-        return (res[3], res[0], res[1], res[2]), offset + 6
-    elif resultShift == 1:
-        return (res[0], res[3], res[1], res[2]), offset + 6
-    elif resultShift == 2:
-        return (res[0], res[1], res[3], res[2]), offset + 6
-    else:
-        return (res[0], res[1], res[2], res[3]), offset + 6
+    values = [x, y, z, w]
+    if result_shift == 0:
+        return (values[3], values[0], values[1], values[2])
+    if result_shift == 1:
+        return (values[0], values[3], values[1], values[2])
+    if result_shift == 2:
+        return (values[0], values[1], values[3], values[2])
+    return (values[0], values[1], values[2], values[3])
 
 
-def read_quat(q_type, data, offset, endian="<"):
-    if q_type == QT_32bit:
-        return read_32_quat(data, offset, endian)
-    elif q_type == QT_40bit:
-        return read_40_quat(data, offset, endian)
-    elif q_type == QT_48bit:
-        return read_48_quat(data, offset, endian)
+def read_quaternion(
+    data: bytes, offset: int, quantization: int, little_endian: bool
+) -> Tuple[Tuple[float, float, float, float], int]:
+    if quantization == QuantizationType.QT_32BIT:
+        return _read32_quat(data, offset, little_endian), offset + 4
+    if quantization == QuantizationType.QT_40BIT:
+        return _read40_quat(data, offset, little_endian), offset + 5
+    if quantization in (QuantizationType.QT_48BIT, QuantizationType.QT_16BIT_QUAT):
+        return _read48_quat(data, offset, little_endian), offset + 6
+    if quantization == QuantizationType.QT_UNCOMPRESSED:
+        fmt = "<ffff" if little_endian else ">ffff"
+        quat = struct.unpack_from(fmt, data, offset)
+        return quat, offset + 16
     return (0.0, 0.0, 0.0, 1.0), offset
 
 
-def find_knot_span(degree, value, c_points_size, knots):
-    if value >= knots[c_points_size]:
-        return c_points_size - 1
+@dataclass
+class SplineDynamicVectorTrack:
+    control_points: List[List[float]]
+    knots: List[int]
+    degree: int
 
+    def value_at(self, local_frame: float) -> Tuple[float, float, float]:
+        return (
+            self._value_for_axis(0, local_frame),
+            self._value_for_axis(1, local_frame),
+            self._value_for_axis(2, local_frame),
+        )
+
+    def _value_for_axis(self, axis: int, local_frame: float) -> float:
+        points = self.control_points[axis]
+        if len(points) == 1:
+            return points[0]
+        knot_span = _find_knot_span(self.degree, local_frame, len(points), self.knots)
+        return _get_single_point(knot_span, self.degree, local_frame, self.knots, points)  # type: ignore[return-value]
+
+
+@dataclass
+class SplineDynamicQuatTrack:
+    control_points: List[Tuple[float, float, float, float]]
+    knots: List[int]
+    degree: int
+
+    def value_at(self, local_frame: float) -> Tuple[float, float, float, float]:
+        knot_span = _find_knot_span(
+            self.degree, local_frame, len(self.control_points), self.knots
+        )
+        return _get_single_point(knot_span, self.degree, local_frame, self.knots, self.control_points)  # type: ignore[return-value]
+
+
+@dataclass
+class TransformTrack:
+    position: Tuple[float, float, float]
+    rotation: Tuple[float, float, float, float]
+    scale: Tuple[float, float, float]
+
+    def __iter__(self):
+        yield self.position
+        yield self.rotation
+        yield self.scale
+
+
+@dataclass
+class TransformSplineBlock:
+    masks: List[TransformMask]
+    pos_tracks: List[SplineDynamicVectorTrack | None]
+    rot_tracks: List[SplineDynamicQuatTrack | None]
+    pos_static: List[Tuple[float, float, float]]
+    rot_static: List[Tuple[float, float, float, float]]
+    scale_tracks: List[SplineDynamicVectorTrack | None]
+    scale_static: List[Tuple[float, float, float]]
+
+    def sample(self, track_index: int, frame: float) -> TransformTrack:
+        mask = self.masks[track_index]
+        position = self._sample_vector(
+            mask,
+            track_index,
+            frame,
+            TransformType.POS_X,
+            self.pos_tracks,
+            self.pos_static,
+            default=(0.0, 0.0, 0.0),
+        )
+        rotation = self._sample_quaternion(mask, track_index, frame)
+        scale = self._sample_vector(
+            mask,
+            track_index,
+            frame,
+            TransformType.SCALE_X,
+            self.scale_tracks,
+            self.scale_static,
+            default=(1.0, 1.0, 1.0),
+        )
+        return TransformTrack(position, rotation, scale)
+
+    def _sample_vector(
+        self,
+        mask: TransformMask,
+        track_index: int,
+        frame: float,
+        base_type: int,
+        dynamic_tracks: List[SplineDynamicVectorTrack | None],
+        static_tracks: List[Tuple[float, float, float]],
+        default: Tuple[float, float, float],
+    ) -> Tuple[float, float, float]:
+        track_type = mask.sub_track_type(base_type)
+        if track_type == SplineTrackType.DYNAMIC:
+            track = dynamic_tracks[track_index]
+            if track is None:
+                return default
+            return track.value_at(frame)
+        if track_type == SplineTrackType.STATIC:
+            return static_tracks[track_index]
+        return default
+
+    def _sample_quaternion(
+        self, mask: TransformMask, track_index: int, frame: float
+    ) -> Tuple[float, float, float, float]:
+        track_type = mask.sub_track_type(TransformType.ROTATION)
+        if track_type == SplineTrackType.DYNAMIC:
+            track = self.rot_tracks[track_index]
+            if track is None:
+                return (0.0, 0.0, 0.0, 1.0)
+            return track.value_at(frame)
+        if track_type == SplineTrackType.STATIC:
+            return self.rot_static[track_index]
+        return (0.0, 0.0, 0.0, 1.0)
+
+
+def _find_knot_span(
+    degree: int, value: float, num_points: int, knots: Sequence[int]
+) -> int:
+    if value >= knots[num_points]:
+        return num_points - 1
     low = degree
-    high = c_points_size
+    high = num_points
     mid = (low + high) // 2
-
     while value < knots[mid] or value >= knots[mid + 1]:
         if value < knots[mid]:
             high = mid
         else:
             low = mid
         mid = (low + high) // 2
-
     return mid
 
 
-def get_single_point(knot_span_index, degree, frame, knots, c_points):
-    N = [0.0] * 6
-    N[0] = 1.0
-
+def _get_single_point(
+    knot_span: int,
+    degree: int,
+    frame: float,
+    knots: Sequence[int],
+    control_points: Sequence[Tuple[float, ...] | float],
+) -> Tuple[float, ...] | float:
+    n_vals = [0.0] * (degree + 1)
+    n_vals[0] = 1.0
     for i in range(1, degree + 1):
         for j in range(i - 1, -1, -1):
-            denom = knots[knot_span_index + i - j] - knots[knot_span_index - j]
-            if denom == 0:
-                A = 0
+            denom = knots[knot_span + i - j] - knots[knot_span - j]
+            a = 0.0 if denom == 0 else (frame - knots[knot_span - j]) / denom
+            tmp = n_vals[j] * a
+            n_vals[j + 1] += n_vals[j] - tmp
+            n_vals[j] = tmp
+
+    accum = None
+    for i in range(degree + 1):
+        weight = n_vals[i]
+        point = control_points[knot_span - i]
+        if accum is None:
+            if isinstance(point, tuple):
+                accum = tuple(component * weight for component in point)
             else:
-                A = (frame - knots[knot_span_index - j]) / denom
-
-            tmp = N[j] * A
-            N[j + 1] += N[j] - tmp
-            N[j] = tmp
-
-    is_vector = isinstance(c_points[0], (list, tuple))
-    if is_vector:
-        dim = len(c_points[0])
-        ret_val = [0.0] * dim
-        for i in range(degree + 1):
-            weight = N[i]
-            pt = c_points[knot_span_index - i]
-            for k in range(dim):
-                ret_val[k] += pt[k] * weight
-        return tuple(ret_val)
-    else:
-        ret_val = 0.0
-        for i in range(degree + 1):
-            ret_val += c_points[knot_span_index - i] * N[i]
-        return ret_val
+                accum = point * weight
+        else:
+            if isinstance(point, tuple):
+                accum = tuple(accum[idx] + component * weight for idx, component in enumerate(point))  # type: ignore[index]
+            else:
+                accum = accum + point * weight  # type: ignore[assignment]
+    assert accum is not None
+    return accum
 
 
 class SplineDecompressor:
-    def __init__(self):
-        self.tracks = []
-        self.block_duration = 0.0
-        self.endian = "<"
+    def __init__(self, little_endian: bool = True):
+        self.blocks: List[TransformSplineBlock] = []
+        self.little_endian = little_endian
 
     def decompress(
         self,
-        data,
-        block_offsets,
-        num_transform_tracks,
-        num_float_tracks,
-        block_duration,
-        little_endian=True,
-    ):
-        self.endian = "<" if little_endian else ">"
-        self.block_duration = block_duration
-        for block_offset in block_offsets:
-            self.parse_block(data, block_offset, num_transform_tracks, num_float_tracks)
-
-    def parse_block(self, data, offset, num_transform_tracks, num_float_tracks):
-        masks = []
-        curr_offset = offset
-        has_dynamic = False
-        for i in range(num_transform_tracks):
-            mask_data = data[curr_offset : curr_offset + 4]
-            mask = TransformMask(mask_data)
-            masks.append(mask)
-
-            # Check for dynamic (simple check)
-            is_dyn = False
-            if mask.positionTypes & 0x70:
-                is_dyn = True  # Bits 4,5,6
-            if mask.rotationTypes & 0xF0:
-                is_dyn = True
-            if mask.scaleTypes & 0x70:
-                is_dyn = True
-
-            if is_dyn:
-                has_dynamic = True
-            curr_offset += 4
-
-        curr_offset += num_float_tracks
-
-        curr_offset = apply_padding(curr_offset, 4)
-
-        for i in range(num_transform_tracks):
-            mask = masks[i]
-
-            pos_track = self.parse_vector_track(
-                data, curr_offset, mask, ttPosX, mask.get_pos_quantization_type(), 0.0
+        data_buffer: bytes,
+        block_offsets: Sequence[int],
+        num_transform_tracks: int,
+        num_float_tracks: int,
+    ) -> None:
+        logger.info(
+            "SplineDecompressor: decompressing %d blocks (tracks=%d floats=%d)",
+            len(block_offsets),
+            num_transform_tracks,
+            num_float_tracks,
+        )
+        self.blocks = []
+        for idx, offset in enumerate(block_offsets):
+            if offset >= len(data_buffer):
+                logger.warning(
+                    "SplineDecompressor: block %d offset %d beyond buffer size %d",
+                    idx,
+                    offset,
+                    len(data_buffer),
+                )
+                continue
+            block_start = time.perf_counter()
+            block = self._parse_block(
+                data_buffer, offset, num_transform_tracks, num_float_tracks
             )
-            curr_offset = pos_track["next_offset"]
+            self.blocks.append(block)
+            logger.debug(
+                "SplineDecompressor: parsed block %d/%d at offset %d in %.3fs",
+                idx + 1,
+                len(block_offsets),
+                offset,
+                time.perf_counter() - block_start,
+            )
 
-            rot_track = self.parse_rotation_track(data, curr_offset, mask)
-            curr_offset = rot_track["next_offset"]
+    def _parse_block(
+        self,
+        data: bytes,
+        offset: int,
+        num_transform_tracks: int,
+        num_float_tracks: int,
+    ) -> TransformSplineBlock:
+        masks: List[TransformMask] = []
+        pos_tracks: List[SplineDynamicVectorTrack | None] = []
+        pos_static: List[Tuple[float, float, float]] = []
+        rot_tracks: List[SplineDynamicQuatTrack | None] = []
+        rot_static: List[Tuple[float, float, float, float]] = []
+        scale_tracks: List[SplineDynamicVectorTrack | None] = []
+        scale_static: List[Tuple[float, float, float]] = []
 
-            scale_track = self.parse_vector_track(
+        cursor = offset
+        for _ in range(num_transform_tracks):
+            masks.append(TransformMask.from_bytes(data[cursor : cursor + 4]))
+            cursor += 4
+        cursor += num_float_tracks
+        cursor = _apply_padding(cursor)
+
+        for mask in masks:
+            pos_track, pos_static_value, cursor = self._parse_vector_track(
                 data,
-                curr_offset,
+                cursor,
                 mask,
-                ttScaleX,
-                mask.get_scale_quantization_type(),
-                1.0,
+                mask.pos_quantization(),
+                TransformType.POS_X,
+                default_value=0.0,
             )
-            curr_offset = scale_track["next_offset"]
+            pos_tracks.append(pos_track)
+            pos_static.append(pos_static_value)
 
-            self.tracks.append(
-                {"pos": pos_track, "rot": rot_track, "scale": scale_track}
+            rot_track, rot_static_value, cursor = self._parse_rotation_track(
+                data, cursor, mask
             )
+            rot_tracks.append(rot_track)
+            rot_static.append(rot_static_value)
 
-    def parse_vector_track(self, data, offset, mask, type_start, q_type, def_val):
-        is_dynamic = False
-        for i in range(3):
-            if mask.get_sub_track_type(type_start + i) == STT_DYNAMIC:
-                is_dynamic = True
-                break
+            scale_track, scale_static_value, cursor = self._parse_vector_track(
+                data,
+                cursor,
+                mask,
+                mask.scale_quantization(),
+                TransformType.SCALE_X,
+                default_value=1.0,
+            )
+            scale_tracks.append(scale_track)
+            scale_static.append(scale_static_value)
 
-        if is_dynamic:
-            num_items = struct.unpack_from(self.endian + "H", data, offset)[0]
-            offset += 2
-            degree = struct.unpack_from(self.endian + "B", data, offset)[0]
-            offset += 1
+            cursor = _apply_padding(cursor)
 
-            buffer_skip = num_items + degree + 2
-            knots = struct.unpack_from(f"{self.endian}{buffer_skip}B", data, offset)
-            offset += buffer_skip
+        return TransformSplineBlock(
+            masks=masks,
+            pos_tracks=pos_tracks,
+            rot_tracks=rot_tracks,
+            pos_static=pos_static,
+            rot_static=rot_static,
+            scale_tracks=scale_tracks,
+            scale_static=scale_static,
+        )
 
-            offset = apply_padding(offset, 4)
+    def _parse_vector_track(
+        self,
+        data: bytes,
+        offset: int,
+        mask: TransformMask,
+        quantization_type: int,
+        base_type: int,
+        default_value: float,
+    ) -> Tuple[SplineDynamicVectorTrack | None, Tuple[float, float, float], int]:
+        if any(
+            mask.sub_track_type(base_type + axis) == SplineTrackType.DYNAMIC
+            for axis in range(3)
+        ):
+            try:
+                num_items = _read_u16(data, offset, self.little_endian)
+                offset += 2
+                degree = _read_u8(data, offset)
+                offset += 1
+                knot_count = num_items + degree + 2
+                knots = list(data[offset : offset + knot_count])
+                if len(knots) != knot_count:
+                    raise IndexError("vector knot buffer truncated")
+                offset += knot_count
+                offset = _apply_padding(offset)
 
-            extremes = []
-            tracks = [[], [], []]
+                extremes: List[Tuple[float, float]] = []
+                control_points = [[0.0] * (num_items + 1) for _ in range(3)]
+                static_defaults: List[float] = []
 
-            for i in range(3):
-                ttype = mask.get_sub_track_type(type_start + i)
-                if ttype == STT_DYNAMIC:
-                    emin, emax = struct.unpack_from(self.endian + "ff", data, offset)
-                    offset += 8
-                    extremes.append((emin, emax))
-                    tracks[i] = [0.0] * (num_items + 1)
-                elif ttype == STT_STATIC:
-                    val = struct.unpack_from(self.endian + "f", data, offset)[0]
-                    offset += 4
-                    extremes.append(None)
-                    tracks[i] = [val]
-                else:
-                    extremes.append(None)
-                    tracks[i] = [def_val]
+                for axis in range(3):
+                    comp_type = mask.sub_track_type(base_type + axis)
+                    if comp_type == SplineTrackType.DYNAMIC:
+                        min_val = _read_f32(data, offset, self.little_endian)
+                        max_val = _read_f32(data, offset + 4, self.little_endian)
+                        extremes.append((min_val, max_val))
+                        offset += 8
+                    elif comp_type == SplineTrackType.STATIC:
+                        static_defaults.append(
+                            _read_f32(data, offset, self.little_endian)
+                        )
+                        extremes.append((0.0, 0.0))
+                        offset += 4
+                    else:
+                        static_defaults.append(default_value)
+                        extremes.append((0.0, 0.0))
 
-            fractal8 = 1.0 / 255.0
-            fractal16 = 1.0 / 65535.0
+                def unpack_point(axis_index: int, idx: int, value: int) -> None:
+                    min_val, max_val = extremes[axis_index]
+                    if max_val == min_val:
+                        control_points[axis_index][idx] = min_val
+                    else:
+                        fraction = value / (
+                            255.0
+                            if quantization_type == QuantizationType.QT_8BIT
+                            else 65535.0
+                        )
+                        control_points[axis_index][idx] = (
+                            min_val + (max_val - min_val) * fraction
+                        )
 
-            for t in range(num_items + 1):
-                for i in range(3):
-                    ttype = mask.get_sub_track_type(type_start + i)
-                    if ttype == STT_DYNAMIC:
-                        if q_type == QT_8bit:
-                            val = struct.unpack_from(self.endian + "B", data, offset)[0]
+                for idx in range(num_items + 1):
+                    for axis in range(3):
+                        comp_type = mask.sub_track_type(base_type + axis)
+                        if comp_type != SplineTrackType.DYNAMIC:
+                            continue
+                        if quantization_type == QuantizationType.QT_8BIT:
+                            raw = _read_u8(data, offset)
                             offset += 1
-                            dVar = float(val) * fractal8
+                            unpack_point(axis, idx, raw)
                         else:
-                            val = struct.unpack_from(self.endian + "H", data, offset)[0]
+                            raw = _read_u16(data, offset, self.little_endian)
                             offset += 2
-                            dVar = float(val) * fractal16
+                            unpack_point(axis, idx, raw)
+                    if quantization_type == QuantizationType.QT_16BIT:
+                        offset = _apply_padding(offset, alignment=2)
 
-                        emin, emax = extremes[i]
-                        tracks[i][t] = emin + (emax - emin) * dVar
+                offset = _apply_padding(offset)
+                static_value = tuple(
+                    (
+                        static_defaults[axis]
+                        if mask.sub_track_type(base_type + axis)
+                        != SplineTrackType.DYNAMIC
+                        else control_points[axis][0]
+                    )
+                    for axis in range(3)
+                )
+                track = SplineDynamicVectorTrack(control_points, knots, degree)
+                return track, static_value, offset
+            except (IndexError, struct.error):
+                return None, (default_value, default_value, default_value), len(data)
 
-            offset = apply_padding(offset, 4)
-
-            return {
-                "type": "spline",
-                "degree": degree,
-                "knots": knots,
-                "tracks": tracks,
-                "next_offset": offset,
-            }
-        else:
-            vals = []
-            for i in range(3):
-                ttype = mask.get_sub_track_type(type_start + i)
-                if ttype == STT_STATIC:
-                    val = struct.unpack_from(self.endian + "f", data, offset)[0]
-                    offset += 4
-                    vals.append(val)
-                else:
-                    vals.append(def_val)
-
-            return {"type": "static", "value": tuple(vals), "next_offset": offset}
-
-    def parse_rotation_track(self, data, offset, mask):
-        if mask.get_sub_track_type(ttRotation) == STT_DYNAMIC:
-            num_items = struct.unpack_from(self.endian + "H", data, offset)[0]
-            offset += 2
-            degree = struct.unpack_from(self.endian + "B", data, offset)[0]
-            offset += 1
-
-            buffer_skip = num_items + degree + 2
-            knots = struct.unpack_from(f"{self.endian}{buffer_skip}B", data, offset)
-            offset += buffer_skip
-
-            q_type = mask.get_rot_quantization_type()
-            if q_type == QT_48bit:
-                offset = apply_padding(offset, 2)
-            elif q_type == QT_32bit:
-                offset = apply_padding(offset, 4)
-
-            points = []
-            for _ in range(num_items + 1):
-                pt, offset = read_quat(q_type, data, offset, self.endian)
-                points.append(pt)
-
-            offset = apply_padding(offset, 4)
-
-            return {
-                "type": "spline",
-                "degree": degree,
-                "knots": knots,
-                "points": points,
-                "next_offset": offset,
-            }
-        else:
-            if mask.get_sub_track_type(ttRotation) == STT_STATIC:
-                q_type = mask.get_rot_quantization_type()
-                pt, offset = read_quat(q_type, data, offset, self.endian)
-                offset = apply_padding(offset, 4)
-                return {"type": "static", "value": pt, "next_offset": offset}
+        static_values = []
+        for axis in range(3):
+            comp_type = mask.sub_track_type(base_type + axis)
+            if comp_type == SplineTrackType.STATIC:
+                try:
+                    static_values.append(
+                        _read_f32(data, offset + axis * 4, self.little_endian)
+                    )
+                except (IndexError, struct.error):
+                    static_values.append(default_value)
             else:
-                offset = apply_padding(offset, 4)
-                return {
-                    "type": "static",
-                    "value": (0.0, 0.0, 0.0, 1.0),
-                    "next_offset": offset,
-                }
+                static_values.append(default_value)
+        return None, tuple(static_values), offset + 12
 
-    def sample_all_tracks(self, num_frames, duration):
-        sampled_tracks = []
-        frame_duration = duration / (num_frames - 1) if num_frames > 1 else 0
+    def _parse_rotation_track(
+        self, data: bytes, offset: int, mask: TransformMask
+    ) -> Tuple[SplineDynamicQuatTrack | None, Tuple[float, float, float, float], int]:
+        track_type = mask.sub_track_type(TransformType.ROTATION)
+        quantization = mask.rot_quantization()
+        if track_type == SplineTrackType.DYNAMIC:
+            try:
+                num_items = _read_u16(data, offset, self.little_endian)
+                offset += 2
+                degree = _read_u8(data, offset)
+                offset += 1
+                knot_count = num_items + degree + 2
+                knots = list(data[offset : offset + knot_count])
+                if len(knots) != knot_count:
+                    raise IndexError("rotation knot buffer truncated")
+                offset += knot_count
+                if quantization in (
+                    QuantizationType.QT_48BIT,
+                    QuantizationType.QT_16BIT_QUAT,
+                ):
+                    offset = _apply_padding(offset, alignment=2)
+                elif quantization in (
+                    QuantizationType.QT_32BIT,
+                    QuantizationType.QT_UNCOMPRESSED,
+                ):
+                    offset = _apply_padding(offset)
 
-        for track in self.tracks:
-            frames = []
-            for i in range(num_frames):
-                time = i * frame_duration
-                # Clamp time to duration?
-                if time > duration:
-                    time = duration
+                control_points: List[Tuple[float, float, float, float]] = []
+                for _ in range(num_items + 1):
+                    quat, offset = read_quaternion(
+                        data, offset, quantization, self.little_endian
+                    )
+                    control_points.append(quat)
+                track = SplineDynamicQuatTrack(control_points, knots, degree)
+                return track, control_points[0], offset
+            except (IndexError, struct.error, ValueError):
+                return None, (0.0, 0.0, 0.0, 1.0), len(data)
 
-                # Scale time to knot space (0-255)
-                knot_time = time
-                if self.block_duration > 0:
-                    knot_time = time * (255.0 / self.block_duration)
+        if track_type == SplineTrackType.STATIC:
+            quat, offset = read_quaternion(
+                data, offset, quantization, self.little_endian
+            )
+            return None, quat, offset
 
-                pos = sample_spline_track(track["pos"], knot_time)
-                rot = sample_spline_track(track["rot"], knot_time)
-                scale = sample_spline_track(track["scale"], knot_time)
+        return None, (0.0, 0.0, 0.0, 1.0), offset
 
-                frames.append((pos, rot, scale))
-            sampled_tracks.append(frames)
-        return sampled_tracks
+    def sample_all_tracks(
+        self, num_frames: int, frame_duration: float
+    ) -> List[List[TransformTrack]]:
+        if not self.blocks:
+            return []
+        track_count = len(self.blocks[0].masks)
+        result: List[List[TransformTrack]] = [[] for _ in range(track_count)]
+        if num_frames == 0:
+            return result
 
+        total_duration = frame_duration * num_frames
+        block_duration = total_duration / max(len(self.blocks), 1)
 
-def sample_spline_track(track_data, time):
-    if track_data["type"] == "static":
-        return track_data["value"]
+        logger.info(
+            "SplineDecompressor: sampling %d tracks across %d frames (frame_duration=%.5f block_duration=%.5f)",
+            track_count,
+            num_frames,
+            frame_duration,
+            block_duration,
+        )
 
-    # Spline
-    degree = track_data["degree"]
-    knots = track_data["knots"]
+        frame_log_interval = max(1, num_frames // 10 or 1)
 
-    if "tracks" in track_data:
-        # Vector track (3 components)
-        c_points = list(zip(*track_data["tracks"]))  # Transpose to list of (x,y,z)
-    else:
-        # Quaternion track
-        c_points = track_data["points"]
-
-    c_points_size = len(c_points)
-
-    if c_points_size <= degree:
-        # Fallback for insufficient points: just return the first point or interpolate linearly?
-        # If we have at least 1 point, return it.
-        if c_points_size > 0:
-            return c_points[0]
-        return (0.0, 0.0, 0.0) if isinstance(c_points, list) else 0.0
-
-    knot_span = find_knot_span(degree, time, c_points_size, knots)
-    return get_single_point(knot_span, degree, time, knots, c_points)
+        for frame_idx in range(num_frames):
+            time = frame_idx * frame_duration
+            block_index = min(
+                int(time // max(block_duration, frame_duration)), len(self.blocks) - 1
+            )
+            local_time = time - block_index * block_duration
+            normalized_frame = (
+                0.0 if frame_duration == 0 else local_time / frame_duration
+            )
+            block = self.blocks[block_index]
+            for track_id in range(track_count):
+                result[track_id].append(block.sample(track_id, normalized_frame))
+            if frame_idx % frame_log_interval == 0 or frame_idx == num_frames - 1:
+                logger.debug(
+                    "SplineDecompressor: sampled frame %d/%d (block %d)",
+                    frame_idx + 1,
+                    num_frames,
+                    block_index,
+                )
+        return result

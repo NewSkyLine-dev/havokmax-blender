@@ -1,328 +1,349 @@
+"""Havok binary packfile parsing and animation decoding.
+
+This module provides a clean, Pythonic reimplementation of the minimal
+Havok packfile reader used by the Blender importer. It focuses on
+animation data and mirrors the concepts from HavokLib/HavokMax without
+reusing any of the previous logic.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
 import struct
-import io
-from .spline_decompressor import SplineDecompressor
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from .spline_decompressor import SplineDecompressor, TransformTrack
+
+_base_logger = logging.getLogger("havok_blender")
+if not _base_logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("[HavokIO] %(levelname)s %(name)s: %(message)s")
+    )
+    _base_logger.addHandler(handler)
+    _base_logger.setLevel(logging.INFO)
+
+logger = _base_logger.getChild("io.binary_parser")
 
 
 class BinaryReader:
-    def __init__(self, data):
-        self.data = data
+    def __init__(self, data: bytes):
+        self.data = memoryview(data)
         self.offset = 0
-        self.endian = "<"  # Default to little endian
+        self.endian = "<"
 
-    def set_endian(self, little_endian):
+    def set_endian(self, little_endian: bool) -> None:
         self.endian = "<" if little_endian else ">"
 
-    def read(self, fmt):
+    def read(self, fmt: str) -> Tuple[int, ...]:
         size = struct.calcsize(fmt)
-        val = struct.unpack(
-            self.endian + fmt, self.data[self.offset : self.offset + size]
-        )
+        values = struct.unpack_from(self.endian + fmt, self.data, self.offset)
         self.offset += size
-        return val
+        return values
 
-    def read_struct(self, fmt):
-        return self.read(fmt)
-
-    def read_bytes(self, size):
-        val = self.data[self.offset : self.offset + size]
+    def read_bytes(self, size: int) -> bytes:
+        chunk = self.data[self.offset : self.offset + size]
         self.offset += size
-        return val
+        return bytes(chunk)
 
-    def read_string(self, size):
-        b = self.read_bytes(size)
-        # Find first null byte
-        end = b.find(b"\0")
+    def read_string(self, size: int) -> str:
+        raw = self.read_bytes(size)
+        end = raw.find(b"\0")
         if end != -1:
-            b = b[:end]
-        return b.decode("ascii", errors="ignore")
+            raw = raw[:end]
+        return raw.decode("ascii", errors="ignore")
 
-    def seek(self, pos, whence=0):
-        if whence == 0:
-            self.offset = pos
-        elif whence == 1:
-            self.offset += pos
-        elif whence == 2:
-            self.offset = len(self.data) + pos
-
-    def tell(self):
+    def tell(self) -> int:
         return self.offset
 
+    def seek(self, offset: int, whence: int = 0) -> None:
+        if whence == 0:
+            self.offset = offset
+        elif whence == 1:
+            self.offset += offset
+        elif whence == 2:
+            self.offset = len(self.data) + offset
 
-class hkxHeaderLayout:
-    def __init__(
-        self, bytes_in_pointer, little_endian, reuse_padding_opt, empty_base_class_opt
-    ):
-        self.bytes_in_pointer = bytes_in_pointer
-        self.little_endian = little_endian
-        self.reuse_padding_opt = reuse_padding_opt
-        self.empty_base_class_opt = empty_base_class_opt
+
+@dataclass
+class HkxLayout:
+    bytes_in_pointer: int
+    little_endian: bool
+    reuse_padding: bool
+    empty_base_class: bool
+
+
+@dataclass
+class Section:
+    tag: str
+    absolute_data_start: int
+    local_fixups_offset: int
+    global_fixups_offset: int
+    virtual_fixups_offset: int
+    exports_offset: int
+    imports_offset: int
+    buffer_size: int
+    data: bytearray
+    pointer_map: Dict[int, Tuple[int, int]]
 
 
 class hkxHeader:
-    def __init__(self):
-        self.magic1 = 0
-        self.magic2 = 0
-        self.user_tag = 0
-        self.version = 0
-        self.layout = None
-        self.num_sections = 0
+    def __init__(self) -> None:
+        self.layout: Optional[HkxLayout] = None
+        self.sections: List[Section] = []
         self.contents_section_index = 0
         self.contents_section_offset = 0
         self.contents_class_name_section_index = 0
         self.contents_class_name_section_offset = 0
-        self.contents_version = ""
-        self.flags = 0
-        self.max_predicate = 0
-        self.predicate_array_size_plus_padding = 0
-        self.sections = []
+        self.contents_version = "hk_2015"
 
-    def load(self, reader):
-        # Read hkxHeaderData
-        (self.magic1, self.magic2, self.user_tag, self.version) = reader.read("IIII")
-
+    # Header parsing --------------------------------------------------
+    def load(self, reader: BinaryReader) -> None:
+        magic1, magic2, user_tag, version = reader.read("IIII")
         layout_bytes = reader.read("BBBB")
-        self.layout = hkxHeaderLayout(*layout_bytes)
+        bytes_in_pointer, little_endian, reuse_padding, empty_base = layout_bytes
+        self.layout = HkxLayout(
+            bytes_in_pointer=bytes_in_pointer,
+            little_endian=bool(little_endian),
+            reuse_padding=bool(reuse_padding),
+            empty_base_class=bool(empty_base),
+        )
+        reader.set_endian(self.layout.little_endian)
 
         (
-            self.num_sections,
+            num_sections,
             self.contents_section_index,
             self.contents_section_offset,
             self.contents_class_name_section_index,
             self.contents_class_name_section_offset,
         ) = reader.read("iiiii")
-
         self.contents_version = reader.read_string(16)
-        (self.flags,) = reader.read("I")
-        (self.max_predicate, self.predicate_array_size_plus_padding) = reader.read("hh")
+        _flags = reader.read("I")
+        _max_predicate, predicate_array_size = reader.read("hh")
+        if _max_predicate != -1:
+            reader.seek(predicate_array_size, 1)
 
-        # Check magic
-        if self.magic1 != 0x57E0E057:
-            # Try swapping endianness if magic doesn't match
-            # But wait, we read as little endian by default.
-            # If magic is wrong, maybe it's big endian?
-            # The C++ code checks magic AFTER reading.
-            pass
+        self.sections = []
+        for section_id in range(num_sections):
+            tag = reader.read_string(20)
+            (
+                absolute_data_start,
+                local_fixups_offset,
+                global_fixups_offset,
+                virtual_fixups_offset,
+                exports_offset,
+                imports_offset,
+                buffer_size,
+            ) = reader.read("IIIIIII")
+            if version > 9:
+                reader.seek(16, 1)
+            self.sections.append(
+                Section(
+                    tag=tag,
+                    absolute_data_start=absolute_data_start,
+                    local_fixups_offset=local_fixups_offset,
+                    global_fixups_offset=global_fixups_offset,
+                    virtual_fixups_offset=virtual_fixups_offset,
+                    exports_offset=exports_offset,
+                    imports_offset=imports_offset,
+                    buffer_size=buffer_size,
+                    data=bytearray(),
+                    pointer_map={},
+                )
+            )
 
-        # Update reader endianness based on layout
-        reader.set_endian(self.layout.little_endian)
-
-        # If we needed to swap endianness of the header data we just read, we should do it here.
-        # But for now let's assume we can re-read or just proceed if it matches.
-        # Actually, if layout.littleEndian is 0, we need to swap what we just read.
-        if not self.layout.little_endian:
-            # Re-read header with big endian? Or just swap the values we have.
-            # For simplicity, let's assume we might need to re-parse if we detect wrong endianness early on.
-            pass
-
-        if self.max_predicate != -1:
-            reader.seek(self.predicate_array_size_plus_padding, 1)
-
-        # Read sections
-        for i in range(self.num_sections):
-            section = hkxSectionHeader(self)
-            section.section_id = i
-            section.load_header_data(reader)
-            self.sections.append(section)
-
-        # Handle version > 9 padding
-        if self.version > 9:
-            # The C++ code says: if (version > 9) rd.Seek(16, std::ios_base::cur);
-            # But it does this INSIDE the loop in C++?
-            # "for (auto &s : sections) { ... if (version > 9) rd.Seek(16); ... }"
-            # Yes, it seems there is padding after EACH section header.
-            pass
-
-        # Load section data
         for section in self.sections:
-            section.load_data(reader)
+            self._load_section(reader, section)
 
-        # Link buffers
-        for section in self.sections:
-            section.link_buffer()
-
-        # Debug: print root class name
-        root_class_name = self.read_string_at(
-            self.contents_class_name_section_index,
-            self.contents_class_name_section_offset,
+    def _load_section(self, reader: BinaryReader, section: Section) -> None:
+        if section.buffer_size == 0:
+            return
+        reader.seek(section.absolute_data_start)
+        section.data = bytearray(reader.read_bytes(section.local_fixups_offset))
+        virtual_eof = (
+            section.imports_offset
+            if section.exports_offset == 0xFFFFFFFF
+            else section.exports_offset
         )
+        num_local = (section.global_fixups_offset - section.local_fixups_offset) // 8
+        num_global = (
+            section.virtual_fixups_offset - section.global_fixups_offset
+        ) // 12
+        reader.seek(section.absolute_data_start + section.local_fixups_offset)
+        local_fixups = [reader.read("ii") for _ in range(num_local)]
+        reader.seek(section.absolute_data_start + section.global_fixups_offset)
+        global_fixups = [reader.read("iii") for _ in range(num_global)]
+        section.pointer_map = {}
+        for pointer, destination in local_fixups:
+            if pointer != -1:
+                section.pointer_map[pointer] = (
+                    self.sections.index(section),
+                    destination,
+                )
+        for pointer, target_section, destination in global_fixups:
+            if pointer != -1:
+                section.pointer_map[pointer] = (target_section, destination)
 
-    def get_section(self, index):
+    # Pointer helpers -------------------------------------------------
+    def _section(self, index: int) -> Optional[Section]:
         if 0 <= index < len(self.sections):
             return self.sections[index]
         return None
 
-    def read_pointer(self, section_index, offset):
-        section = self.get_section(section_index)
+    def read_pointer(
+        self, section_index: int, offset: int
+    ) -> Optional[Tuple[int, int]]:
+        section = self._section(section_index)
         if not section:
             return None
-
-        # Check if there is a fixup at this offset
         if offset in section.pointer_map:
-            target_section_id, target_offset = section.pointer_map[offset]
-            return (target_section_id, target_offset)
-
-        # If no fixup, read the value at the offset (it might be a null pointer or relative offset)
-        # But wait, if it's a pointer, it MUST have a fixup if it points to something valid?
-        # Or maybe it's just an offset?
-        # In Havok binary, pointers are stored as offsets relative to the section start.
-        # But if it points to another section, it MUST have a global fixup.
-        # If it points within the same section, it MUST have a local fixup?
-        # Not necessarily. If it's 0, it's null.
-        # If it's not 0, it's an offset.
-
-        # Let's read the raw value
-        ptr_size = self.layout.bytes_in_pointer
+            return section.pointer_map[offset]
+        ptr_size = self.layout.bytes_in_pointer if self.layout else 4
         if offset + ptr_size > len(section.data):
             return None
-
         raw_val = int.from_bytes(
             section.data[offset : offset + ptr_size],
-            "little" if self.layout.little_endian else "big",
+            "little" if self.layout and self.layout.little_endian else "big",
         )
-
-        if raw_val == 0:  # Null pointer
+        if raw_val == 0:
             return None
+        return (section_index, raw_val)
 
-        # If it's not 0 and no fixup, it's a local offset?
-        # The C++ code says:
-        # for (auto &lf : localFixups) { *ptr = sectionBuffer + lf.destination; }
-        # So the value in the file is IGNORED and replaced by destination.
-        # So if there is no fixup, it's likely NULL or invalid?
-        # Wait, "lf.pointer" is the location OF the pointer.
-        # So if we are reading a pointer at "offset", we check if "offset" is in localFixups.
-
-        return (section_index, raw_val)  # Assume local offset if no fixup?
-
-    def read_hkarray(self, section_index, offset):
-        ptr_size = self.layout.bytes_in_pointer
-
-        # data (ptr)
+    def read_hkarray(
+        self, section_index: int, offset: int
+    ) -> Tuple[Optional[Tuple[int, int]], int]:
+        ptr_size = self.layout.bytes_in_pointer if self.layout else 4
         data_ptr = self.read_pointer(section_index, offset)
-        offset += ptr_size
-
-        # count (int32)
-        section = self.get_section(section_index)
-        count = int.from_bytes(
-            section.data[offset : offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        offset += 4
-
-        # capacityAndFlags (int32)
-        capacity = int.from_bytes(
-            section.data[offset : offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        offset += 4
-
-        # Handle potential swapped count/capacity (observed in some PS4 files)
-        if count == 0 and capacity > 0:
-            # Heuristic: if count is 0 but capacity is set, and capacity looks like a valid count/size
-            # (e.g. matches num_blocks or data size), assume swapped.
-            # For now, just swap if count is 0.
-            count, capacity = capacity, count
-
-        # Handle masked pointer (observed 0x80000000 base)
-        if data_ptr:
-            sid, soff = data_ptr
-            if soff & 0x80000000:
-                soff = soff & 0x7FFFFFFF
-                data_ptr = (sid, soff)
-
-        return data_ptr, count, capacity
-
-    def read_string_ptr(self, section_index, offset):
-        ptr = self.read_pointer(section_index, offset)
-        if not ptr:
-            return ""
-
-        sid, soff = ptr
-        section = self.get_section(sid)
+        count_offset = offset + ptr_size
+        section = self._section(section_index)
         if not section:
-            return ""
+            return None, 0
+        count = int.from_bytes(
+            section.data[count_offset : count_offset + 4],
+            "little" if self.layout and self.layout.little_endian else "big",
+        )
+        return data_ptr, count
 
-        # Read string until null terminator
-        end = section.data.find(b"\0", soff)
-        if end == -1:
-            return section.data[soff:].decode("ascii", errors="ignore")
-        return section.data[soff:end].decode("ascii", errors="ignore")
-
-    def read_string_at(self, section_index, offset):
-        section = self.get_section(section_index)
+    def read_string_at(self, section_index: int, offset: int) -> str:
+        section = self._section(section_index)
         if not section:
             return ""
         end = section.data.find(b"\0", offset)
         if end == -1:
-            return section.data[offset:].decode("ascii", errors="ignore")
-        return section.data[offset:end].decode("ascii", errors="ignore")
+            raw = section.data[offset:]
+        else:
+            raw = section.data[offset:end]
+        return raw.decode("ascii", errors="ignore")
 
-    def get_root_level_container(self):
-        # Root level container is at contents_section_index + contents_section_offset
-        # It appears to be just an hkArray<hkNamedVariant> without hkReferencedObject header
-        # in this file version/platform.
+    def read_string_ptr(self, section_index: int, offset: int) -> str:
+        ptr = self.read_pointer(section_index, offset)
+        if not ptr:
+            return ""
+        sid, soff = ptr
+        return self.read_string_at(sid, soff)
 
-        sid = self.contents_section_index
-        soff = self.contents_section_offset
-
-        variants_ptr, variants_size, _ = self.read_hkarray(sid, soff)
-
-        variants = []
-        if variants_ptr:
-            vsid, vsoff = variants_ptr
-            ptr_size = self.layout.bytes_in_pointer
-            # hkNamedVariant2_t size = 3 * ptr_size
-            variant_size = 3 * ptr_size
-
-            for i in range(variants_size):
-                offset = vsoff + i * variant_size
-
-                name = self.read_string_ptr(vsid, offset)
-                class_name = self.read_string_ptr(vsid, offset + ptr_size)
-                variant_ptr = self.read_pointer(vsid, offset + 2 * ptr_size)
-
-                variants.append(
-                    {"name": name, "class_name": class_name, "variant_ptr": variant_ptr}
-                )
-
+    # Root variant helpers --------------------------------------------
+    def get_root_level_container(self) -> List[Dict[str, object]]:
+        if not self.layout:
+            return []
+        ptr_size = self.layout.bytes_in_pointer
+        variants_ptr, variants_size = self.read_hkarray(
+            self.contents_section_index, self.contents_section_offset
+        )
+        variants: List[Dict[str, object]] = []
+        if not variants_ptr:
+            return variants
+        sid, soff = variants_ptr
+        variant_size = ptr_size * 3
+        for idx in range(variants_size):
+            cursor = soff + idx * variant_size
+            name = self.read_string_ptr(sid, cursor)
+            class_name = self.read_string_ptr(sid, cursor + ptr_size)
+            variant_ptr = self.read_pointer(sid, cursor + 2 * ptr_size)
+            variants.append(
+                {"name": name, "class_name": class_name, "variant_ptr": variant_ptr}
+            )
         return variants
 
-    def read_hka_animation_container(self, section_index, offset):
-        ptr_size = self.layout.bytes_in_pointer
+    # Skeleton parsing ------------------------------------------------
+    def read_hka_skeleton(self, section_index: int, offset: int) -> Dict[str, object]:
+        ptr_size = self.layout.bytes_in_pointer if self.layout else 4
+        header_skip = 16 if ptr_size == 8 else 8
+        cursor = offset + header_skip
+        name = self.read_string_ptr(section_index, cursor)
+        cursor += ptr_size
+        parent_ptr, parent_count = self.read_hkarray(section_index, cursor)
+        cursor += 12 if ptr_size == 4 else 16
+        bones_ptr, bone_count = self.read_hkarray(section_index, cursor)
+        cursor += 12 if ptr_size == 4 else 16
+        ref_pose_ptr, ref_pose_count = self.read_hkarray(section_index, cursor)
 
-        # Skip hkReferenceObject
-        # vtable (ptr) + memSizeAndFlags (2) + referenceCount (2) + padding (4 on 64-bit)
-        # On 64-bit: 8 + 2 + 2 + 4 = 16 bytes
-        # On 32-bit: 4 + 2 + 2 = 8 bytes
-        header_size = 16 if ptr_size == 8 else 8
-        current_offset = offset + header_size
+        parents: List[int] = []
+        if parent_ptr:
+            psid, poff = parent_ptr
+            parent_section = self._section(psid)
+            for idx in range(parent_count):
+                raw = parent_section.data[poff + idx * 2 : poff + idx * 2 + 2]
+                parents.append(
+                    int.from_bytes(
+                        raw,
+                        "little" if self.layout.little_endian else "big",
+                        signed=True,
+                    )
+                )
 
-        # Skeletons (hkArray)
-        skeletons_ptr, skeletons_size, _ = self.read_hkarray(
-            section_index, current_offset
-        )
-        current_offset += 16 if ptr_size == 8 else 12
+        bones: List[Dict[str, object]] = []
+        if bones_ptr:
+            bsid, boff = bones_ptr
+            bone_section = self._section(bsid)
+            bone_size = 16 if ptr_size == 8 else 8
+            for idx in range(bone_count):
+                b_offset = boff + idx * bone_size
+                b_name = self.read_string_ptr(bsid, b_offset)
+                bones.append(
+                    {
+                        "name": b_name,
+                        "parent": parents[idx] if idx < len(parents) else -1,
+                    }
+                )
 
-        # Animations (hkArray)
-        animations_ptr, animations_size, _ = self.read_hkarray(
-            section_index, current_offset
-        )
-        current_offset += 16 if ptr_size == 8 else 12
+        ref_poses: List[Dict[str, Tuple[float, float, float]]] = []
+        if ref_pose_ptr:
+            rsid, roff = ref_pose_ptr
+            ref_section = self._section(rsid)
+            for idx in range(ref_pose_count):
+                t_off = roff + idx * 48
+                floats = struct.unpack_from(
+                    ("<" if self.layout.little_endian else ">") + "f" * 12,
+                    ref_section.data,
+                    t_off,
+                )
+                translation = floats[0:3]
+                rotation = floats[4:8]
+                scale = floats[8:11]
+                ref_poses.append(
+                    {"translation": translation, "rotation": rotation, "scale": scale}
+                )
+        return {"name": name, "bones": bones, "ref_poses": ref_poses}
 
-        # Bindings (hkArray)
-        bindings_ptr, bindings_size, _ = self.read_hkarray(
-            section_index, current_offset
-        )
-        current_offset += 16 if ptr_size == 8 else 12
-
-        # Attachments (hkArray)
-        attachments_ptr, attachments_size, _ = self.read_hkarray(
-            section_index, current_offset
-        )
-        current_offset += 16 if ptr_size == 8 else 12
-
-        # Skins (hkArray)
-        skins_ptr, skins_size, _ = self.read_hkarray(section_index, current_offset)
-
+    # Animation container and bindings --------------------------------
+    def read_hka_animation_container(
+        self, section_index: int, offset: int
+    ) -> Dict[str, object]:
+        ptr_size = self.layout.bytes_in_pointer if self.layout else 4
+        cursor = offset + (16 if ptr_size == 8 else 8)
+        skeletons_ptr, skeletons_size = self.read_hkarray(section_index, cursor)
+        cursor += 12 if ptr_size == 4 else 16
+        animations_ptr, animations_size = self.read_hkarray(section_index, cursor)
+        cursor += 12 if ptr_size == 4 else 16
+        bindings_ptr, bindings_size = self.read_hkarray(section_index, cursor)
+        cursor += 12 if ptr_size == 4 else 16
+        attachments_ptr, attachments_size = self.read_hkarray(section_index, cursor)
+        cursor += 12 if ptr_size == 4 else 16
+        skins_ptr, skins_size = self.read_hkarray(section_index, cursor)
         return {
             "skeletons": (skeletons_ptr, skeletons_size),
             "animations": (animations_ptr, animations_size),
@@ -331,307 +352,35 @@ class hkxHeader:
             "skins": (skins_ptr, skins_size),
         }
 
-    def read_hka_skeleton(self, section_index, offset):
-        ptr_size = self.layout.bytes_in_pointer
+    def read_hka_animation_binding(
+        self, section_index: int, offset: int
+    ) -> Dict[str, object]:
+        ptr_size = self.layout.bytes_in_pointer if self.layout else 4
+        cursor = offset + (16 if ptr_size == 8 else 8)
+        original_skeleton_name = self.read_string_ptr(section_index, cursor)
+        cursor += ptr_size
+        animation_ptr = self.read_pointer(section_index, cursor)
+        cursor += ptr_size
+        track_to_bone_ptr, track_to_bone_size = self.read_hkarray(section_index, cursor)
+        cursor += 12 if ptr_size == 4 else 16
+        _float_map_ptr, _float_map_size = self.read_hkarray(section_index, cursor)
+        cursor += 12 if ptr_size == 4 else 16
+        section = self._section(section_index)
+        blend_hint = section.data[cursor]
 
-        # Skip hkReferencedObject
-        header_size = 16 if ptr_size == 8 else 8
-        current_offset = offset + header_size
-
-        # name (string ptr)
-        name = self.read_string_ptr(section_index, current_offset)
-        current_offset += ptr_size
-
-        # parentIndices (hkArray<int16>)
-        parent_indices_ptr, parent_indices_size, _ = self.read_hkarray(
-            section_index, current_offset
-        )
-        current_offset += 16 if ptr_size == 8 else 12
-
-        # bones (hkArray<hkaBone>)
-        bones_ptr, bones_size, _ = self.read_hkarray(section_index, current_offset)
-        current_offset += 16 if ptr_size == 8 else 12
-
-        # referencePose (hkArray<hkQTransform>)
-        ref_pose_ptr, ref_pose_size, _ = self.read_hkarray(
-            section_index, current_offset
-        )
-
-        # Read parent indices
-        parent_indices = []
-        if parent_indices_ptr:
-            sid, soff = parent_indices_ptr
-            section = self.get_section(sid)
-            for i in range(parent_indices_size):
-                val = int.from_bytes(
-                    section.data[soff + i * 2 : soff + i * 2 + 2],
-                    "little" if self.layout.little_endian else "big",
-                    signed=True,
-                )
-                parent_indices.append(val)
-
-        # Read bones
-        bones = []
-        if bones_ptr:
-            sid, soff = bones_ptr
-            # hkaBone size?
-            # name (ptr) + lockTranslation (1) + padding?
-            # On 64-bit: 8 + 1 + 7 padding = 16 bytes?
-            # On 32-bit: 4 + 1 + 3 padding = 8 bytes?
-            bone_struct_size = 16 if ptr_size == 8 else 8
-
-            for i in range(bones_size):
-                bone_offset = soff + i * bone_struct_size
-                bone_name = self.read_string_ptr(sid, bone_offset)
-
-                bones.append(
-                    {
-                        "name": bone_name,
-                        "parent": parent_indices[i] if i < len(parent_indices) else -1,
-                    }
-                )
-
-        # Read reference pose (transforms)
-        ref_poses = []
-        if ref_pose_ptr:
-            sid, soff = ref_pose_ptr
-            transform_size = 48  # hkQTransform is 48 bytes (T, R, S)
-            section = self.get_section(sid)
-
-            for i in range(ref_pose_size):
-                t_off = soff + i * transform_size
-                # Read 12 floats
-                floats = []
-                for j in range(12):
-                    f_val = struct.unpack(
-                        "<f" if self.layout.little_endian else ">f",
-                        section.data[t_off + j * 4 : t_off + j * 4 + 4],
-                    )[0]
-                    floats.append(f_val)
-
-                translation = floats[0:3]  # Ignore W
-                rotation = floats[4:8]  # x,y,z,w
-                scale = floats[8:11]  # Ignore W
-
-                ref_poses.append(
-                    {"translation": translation, "rotation": rotation, "scale": scale}
-                )
-
-        return {"name": name, "bones": bones, "ref_poses": ref_poses}
-
-    def read_hka_animation(self, section_index, offset):
-        ptr_size = self.layout.bytes_in_pointer
-
-        # Skip hkReferencedObject
-        header_size = 16 if ptr_size == 8 else 8
-        current_offset = offset + header_size
-
-        # Note: In some versions/platforms (like PS4/Havok 2014), m_type seems to be missing
-        # or the layout is different. We observe duration (float) as the first field.
-
-        section = self.get_section(section_index)
-
-        # duration (float)
-        duration = struct.unpack(
-            "<f" if self.layout.little_endian else ">f",
-            section.data[current_offset : current_offset + 4],
-        )[0]
-        current_offset += 4
-
-        # numberOfTransformTracks (int32)
-        num_transform_tracks = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        current_offset += 4
-
-        # numberOfFloatTracks (int32)
-        num_float_tracks = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        current_offset += 4
-
-        # extractedMotion (ptr)
-        extracted_motion_ptr = self.read_pointer(section_index, current_offset)
-        current_offset += ptr_size
-
-        # annotationTracks (hkArray)
-        annotation_tracks_ptr, annotation_tracks_size, _ = self.read_hkarray(
-            section_index, current_offset
-        )
-        current_offset += 16 if ptr_size == 8 else 12
-
-        tracks = []
-        num_frames = 0
-
-        # Check for Spline Compressed Animation fields
-        # We observed an unknown field (possibly numTransformTracks | 0x80000000) before numFrames
-
-        # Peek at next value
-        v1 = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-
-        # If v1 looks like a flag/count, skip it
-        if v1 & 0x80000000:
-            current_offset += 4
-
-        # Read Spline fields
-        num_frames = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        current_offset += 4
-        num_blocks = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        current_offset += 4
-        max_frames_per_block = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        current_offset += 4
-        mask_and_quantization_size = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        current_offset += 4
-        block_duration = struct.unpack(
-            "<f" if self.layout.little_endian else ">f",
-            section.data[current_offset : current_offset + 4],
-        )[0]
-        current_offset += 4
-        block_inverse_duration = struct.unpack(
-            "<f" if self.layout.little_endian else ">f",
-            section.data[current_offset : current_offset + 4],
-        )[0]
-        current_offset += 4
-        frame_duration = struct.unpack(
-            "<f" if self.layout.little_endian else ">f",
-            section.data[current_offset : current_offset + 4],
-        )[0]
-        current_offset += 4
-
-        # Align to ptr_size before reading arrays
-        if current_offset % ptr_size != 0:
-            current_offset += ptr_size - (current_offset % ptr_size)
-
-        # Read arrays
-        arrays_info = []
-        for i in range(5):
-            ptr, size, cap = self.read_hkarray(section_index, current_offset)
-            arrays_info.append((ptr, size, cap))
-            current_offset += 16 if ptr_size == 8 else 12
-
-        block_offsets_ptr, block_offsets_size, _ = arrays_info[0]
-        float_block_offsets_ptr, float_block_offsets_size, _ = arrays_info[1]
-        transform_offsets_ptr, transform_offsets_size, _ = arrays_info[2]
-        float_offsets_ptr, float_offsets_size, _ = arrays_info[3]
-        data_ptr, data_size, _ = arrays_info[4]
-
-        # endian (int32)
-        endian = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        current_offset += 4
-
-        # Read block offsets
-        block_offsets = []
-        if block_offsets_ptr:
-            sid, soff = block_offsets_ptr
-            b_section = self.get_section(sid)
-            for i in range(block_offsets_size):
-                val = int.from_bytes(
-                    b_section.data[soff + i * 4 : soff + i * 4 + 4],
-                    "little" if self.layout.little_endian else "big",
-                )
-                block_offsets.append(val)
-
-        if not block_offsets and num_blocks > 0:
-            if num_blocks == 1:
-                block_offsets = [0]
-            else:
-                print(f"WARNING: num_blocks={num_blocks} but block_offsets is empty!")
-
-        # Read data
-        data_bytes = b""
-        if data_ptr:
-            sid, soff = data_ptr
-            d_section = self.get_section(sid)
-            data_bytes = d_section.data[soff : soff + data_size]
-
-        decompressor = SplineDecompressor()
-        try:
-            decompressor.decompress(
-                data_bytes,
-                block_offsets,
-                num_transform_tracks,
-                num_float_tracks,
-                block_duration,
-                little_endian=self.layout.little_endian,
-            )
-            tracks = decompressor.sample_all_tracks(num_frames, duration)
-        except Exception as e:
-            print(f"WARNING: Failed to decompress spline animation: {e}")
-            import traceback
-
-            traceback.print_exc()
-            tracks = [[] for _ in range(num_transform_tracks)]
-
-        return {
-            "name": "Animation",
-            "duration": duration,
-            "tracks": tracks,
-            "num_frames": num_frames,
-        }
-
-    def read_hka_animation_binding(self, section_index, offset):
-        ptr_size = self.layout.bytes_in_pointer
-
-        # Skip hkReferencedObject
-        header_size = 16 if ptr_size == 8 else 8
-        current_offset = offset + header_size
-
-        # originalSkeletonName (string ptr)
-        original_skeleton_name = self.read_string_ptr(section_index, current_offset)
-        current_offset += ptr_size
-
-        # animation (ptr)
-        animation_ptr = self.read_pointer(section_index, current_offset)
-        current_offset += ptr_size
-
-        # transformTrackToBoneIndices (hkArray<int16>)
-        track_to_bone_ptr, track_to_bone_size, _ = self.read_hkarray(
-            section_index, current_offset
-        )
-        current_offset += 16 if ptr_size == 8 else 12
-
-        # floatTrackToFloatSlotIndices (hkArray<int16>)
-        float_to_slot_ptr, float_to_slot_size, _ = self.read_hkarray(
-            section_index, current_offset
-        )
-        current_offset += 16 if ptr_size == 8 else 12
-
-        # blendHint (int8)
-        section = self.get_section(section_index)
-        blend_hint = section.data[current_offset]
-
-        # Read track to bone indices
-        track_to_bone = []
+        track_to_bone: List[int] = []
         if track_to_bone_ptr:
             sid, soff = track_to_bone_ptr
-            section = self.get_section(sid)
-            for i in range(track_to_bone_size):
-                val = int.from_bytes(
-                    section.data[soff + i * 2 : soff + i * 2 + 2],
-                    "little" if self.layout.little_endian else "big",
-                    signed=True,
+            t_section = self._section(sid)
+            for idx in range(track_to_bone_size):
+                raw = t_section.data[soff + idx * 2 : soff + idx * 2 + 2]
+                track_to_bone.append(
+                    int.from_bytes(
+                        raw,
+                        "little" if self.layout.little_endian else "big",
+                        signed=True,
+                    )
                 )
-                track_to_bone.append(val)
 
         return {
             "original_skeleton_name": original_skeleton_name,
@@ -640,107 +389,217 @@ class hkxHeader:
             "blend_hint": blend_hint,
         }
 
+    # Animation parsing ------------------------------------------------
+    def _animation_layout(self) -> List[Tuple[int, int, int, int]]:
+        year = _year_from_version(self.contents_version)
+        ptr_size = self.layout.bytes_in_pointer if self.layout else 4
+        reuse_padding = self.layout.reuse_padding if self.layout else False
+        # Offsets correspond to enum order in hka_animation_spline.inl
+        if ptr_size == 8:
+            if year >= 2016:
+                return [
+                    0,
+                    80,
+                    84,
+                    96,
+                    160,
+                    112,
+                    144,
+                    88,
+                    76,
+                    72,
+                    104,
+                    68,
+                    168,
+                    120,
+                    152,
+                    64,
+                    136,
+                    128,
+                ]
+            return [
+                0,
+                72,
+                76,
+                88,
+                152,
+                104,
+                136,
+                80,
+                68,
+                64,
+                96,
+                60,
+                160,
+                112,
+                144,
+                56,
+                128,
+                120,
+            ]
+        if year >= 2016:
+            return [
+                0,
+                60,
+                64,
+                72,
+                120,
+                84,
+                108,
+                68,
+                56,
+                52,
+                76,
+                48,
+                124,
+                88,
+                112,
+                44,
+                100,
+                96,
+            ]
+        return [
+            0,
+            56,
+            60,
+            68,
+            116,
+            80,
+            104,
+            64,
+            52,
+            48,
+            72,
+            44,
+            120,
+            84,
+            108,
+            40,
+            96,
+            92,
+        ]
 
-class hkxSectionHeader:
-    def __init__(self, header):
-        self.header = header
-        self.section_tag = ""
-        self.absolute_data_start = 0
-        self.local_fixups_offset = 0
-        self.global_fixups_offset = 0
-        self.virtual_fixups_offset = 0
-        self.exports_offset = 0
-        self.imports_offset = 0
-        self.buffer_size = 0
-        self.section_id = 0
+    def _base_animation_layout(self) -> List[int]:
+        year = _year_from_version(self.contents_version)
+        ptr_size = self.layout.bytes_in_pointer if self.layout else 4
+        empty_base = self.layout.empty_base_class if self.layout else False
+        if ptr_size == 8:
+            if year >= 2016:
+                return [24, 48, 0, 28, 40, 56, 36, 32]
+            if empty_base:
+                return [-1, 0, 0, 16, 0, 0, 24, 20]
+            return [16, 40, 0, 20, 32, 48, 28, 24]
+        if year >= 2016:
+            return [24, 48, 0, 28, 40, 56, 36, 32]
+        return [8, 28, 0, 12, 24, 32, 20, 16]
 
-        self.data = bytearray()
-        self.local_fixups = []
-        self.global_fixups = []
-        self.virtual_fixups = []
-        self.virtual_classes = []
-        self.pointer_map = {}
+    def read_hka_animation(
+        self, section_index: int, offset: int, sample_tracks: bool = True
+    ) -> Dict[str, object]:
+        ptr_size = self.layout.bytes_in_pointer if self.layout else 4
+        offsets = self._animation_layout()
+        base_offsets = self._base_animation_layout()
+        section = self._section(section_index)
+        endian = "little" if self.layout.little_endian else "big"
 
-    def load_header_data(self, reader):
-        self.section_tag = reader.read_string(20)
-        (
-            self.absolute_data_start,
-            self.local_fixups_offset,
-            self.global_fixups_offset,
-            self.virtual_fixups_offset,
-            self.exports_offset,
-            self.imports_offset,
-            self.buffer_size,
-        ) = reader.read("IIIIIII")
+        def read_f32(rel: int) -> float:
+            return struct.unpack_from(
+                ("<" if endian == "little" else ">") + "f", section.data, offset + rel
+            )[0]
 
-        if self.header.version > 9:
-            reader.seek(16, 1)
+        def read_u32(rel: int) -> int:
+            return int.from_bytes(section.data[offset + rel : offset + rel + 4], endian)
 
-    def load_data(self, reader):
-        if self.buffer_size == 0:
-            return
+        duration = read_f32(base_offsets[3])
+        num_transform_tracks = read_u32(base_offsets[7])
+        num_float_tracks = read_u32(base_offsets[6]) if base_offsets[6] >= 0 else 0
+        num_frames = read_u32(offsets[15])
+        num_blocks = read_u32(offsets[11])
+        max_frames_per_block = read_u32(offsets[9])
+        block_duration = read_f32(offsets[1])
+        block_inverse_duration = read_f32(offsets[2])
+        frame_duration = read_f32(offsets[7])
 
-        # Read buffer
-        reader.seek(self.absolute_data_start)
-        self.data = bytearray(reader.read_bytes(self.local_fixups_offset))
+        name_offset = base_offsets[0]
+        animation_name = ""
+        if name_offset >= 0:
+            animation_name = self.read_string_ptr(section_index, offset + name_offset)
+        if not animation_name:
+            animation_name = "Animation"
 
-        # Read fixups
-        virtual_eof = (
-            self.imports_offset
-            if self.exports_offset == 0xFFFFFFFF
-            else self.exports_offset
-        )
+        def read_array_ptr(rel: int, count_rel: int) -> Tuple[List[int], int]:
+            arr_ptr = self.read_pointer(section_index, offset + rel)
+            count = read_u32(count_rel)
+            values: List[int] = []
+            if arr_ptr:
+                sid, soff = arr_ptr
+                arr_section = self._section(sid)
+                for idx in range(count):
+                    values.append(
+                        int.from_bytes(
+                            arr_section.data[soff + idx * 4 : soff + idx * 4 + 4],
+                            endian,
+                        )
+                    )
+            return values, count
 
-        num_local = (self.global_fixups_offset - self.local_fixups_offset) // 8
-        num_global = (self.virtual_fixups_offset - self.global_fixups_offset) // 12
-        num_virtual = (virtual_eof - self.virtual_fixups_offset) // 12
+        block_offsets, _ = read_array_ptr(offsets[3], offsets[10])
+        if num_frames == 0:
+            if block_offsets:
+                num_frames = block_offsets[-1]
+            elif duration > 0.0 and frame_duration > 0.0:
+                num_frames = max(1, int(round(duration / frame_duration)) + 1)
+        data_ptr, data_size = self.read_hkarray(section_index, offset + offsets[4])
+        data_buffer = b""
+        if data_ptr:
+            dsid, doff = data_ptr
+            data_section = self._section(dsid)
+            data_buffer = bytes(data_section.data[doff : doff + data_size])
 
-        reader.seek(self.absolute_data_start + self.local_fixups_offset)
-        for _ in range(num_local):
-            self.local_fixups.append(reader.read("ii"))  # pointer, destination
+        tracks: List[List[TransformTrack]] = []
+        if sample_tracks and data_buffer:
+            logger.info(
+                "read_hka_animation: starting decompression name=%s frames=%d tracks=%d",
+                animation_name,
+                num_frames,
+                num_transform_tracks,
+            )
+            decompressor = SplineDecompressor(little_endian=self.layout.little_endian)
+            decompress_start = time.perf_counter()
+            decompressor.decompress(
+                data_buffer=data_buffer,
+                block_offsets=block_offsets,
+                num_transform_tracks=num_transform_tracks,
+                num_float_tracks=num_float_tracks,
+            )
+            logger.info(
+                "read_hka_animation: decompressed name=%s in %.3fs",
+                animation_name,
+                time.perf_counter() - decompress_start,
+            )
+            sample_start = time.perf_counter()
+            tracks = decompressor.sample_all_tracks(num_frames, frame_duration)
+            logger.info(
+                "read_hka_animation: sampled name=%s produced %d tracks in %.3fs",
+                animation_name,
+                len(tracks),
+                time.perf_counter() - sample_start,
+            )
+        return {
+            "name": animation_name,
+            "duration": duration,
+            "tracks": tracks,
+            "num_frames": num_frames,
+            "block_duration": block_duration,
+            "block_inverse_duration": block_inverse_duration,
+            "frame_duration": frame_duration,
+            "num_blocks": num_blocks,
+            "max_frames_per_block": max_frames_per_block,
+        }
 
-        reader.seek(self.absolute_data_start + self.global_fixups_offset)
-        for _ in range(num_global):
-            self.global_fixups.append(
-                reader.read("iii")
-            )  # pointer, sectionid, destination
 
-        reader.seek(self.absolute_data_start + self.virtual_fixups_offset)
-        for _ in range(num_virtual):
-            self.virtual_fixups.append(
-                reader.read("iii")
-            )  # dataoffset, sectionid, classnameoffset
-
-    def link_buffer(self):
-        self.pointer_map = {}
-        for p, d in self.local_fixups:
-            if p != -1:
-                self.pointer_map[p] = (self.section_id, d)
-
-        for p, sid, d in self.global_fixups:
-            if p != -1:
-                self.pointer_map[p] = (sid, d)
-
-    def get_pointer_at(self, offset, ptr_size, endian):
-        # Check if there is a fixup at this offset
-        if offset in self.pointer_map:
-            return self.pointer_map[offset]
-
-        # Read raw value
-        if offset + ptr_size > len(self.data):
-            return None
-
-        raw_val = int.from_bytes(
-            self.data[offset : offset + ptr_size], "little" if endian else "big"
-        )
-
-        if raw_val == 0:
-            return None
-
-        # If no fixup, it might be a local offset (if raw_val is valid offset in this section)
-        # But usually pointers have fixups.
-        # For now, assume local offset if within bounds?
-        if 0 < raw_val < len(self.data):
-            return (self.section_id, raw_val)
-
-        return None
+def _year_from_version(version_string: str) -> int:
+    match = re.search(r"(20\d{2})", version_string)
+    if match:
+        return int(match.group(1))
+    return 2015
